@@ -738,11 +738,11 @@ wait "$inside" 2>/dev/null || :
     def test_fit_table_lists_unreviewed(self):
         self.fit_set()
         result = self.cli("fit")
-        for text in ("build", "hard", "review", "ok · good", "—", "还没评过的", "build × ds"):
+        for text in ("build", "hard", "review", "design", "ok · good", "—", "还没评过的", "build × ds"):
             self.assertIn(text, result.stdout)
         self.assertNotIn("scout |", result.stdout)
-        self.assertNotIn("design |", result.stdout)
-        self.assertEqual(len(result.stdout.splitlines()), 5)
+        self.assertIn("design |", result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 6)
 
     def fit_start(self, verdict):
         self.fit_set(verdict=verdict, note="too risky")

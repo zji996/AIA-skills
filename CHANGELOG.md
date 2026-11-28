@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：新增 `--class design` 设计稿类别（默认 thinking `high`，纳入 `delegate fit` 四类适配卡），用户配置新增可选 `classModels`（如 `{"design":"carbon"}`）并在未传 `--model` 时优先选用（未配置退回 tier 默认并提示一行，`--model` 永远优先）；仓库 `.delegate.json` 新增 `designPaths`（纯路径前缀/通配匹配，不按关键词），未写 `--class` 但说明提及匹配路径时自动推断为 `design` 并在回执标「推断」。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.59.0 - 2026-11-28

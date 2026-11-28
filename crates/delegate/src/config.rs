@@ -388,6 +388,22 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
                 validate_tier(tier, model)?;
             }
         }
+        if let Some(class_models) = value.get("classModels") {
+            if !class_models.is_null() {
+                let map = class_models.as_object().ok_or(
+                    "classModels must be an object mapping class names to model aliases",
+                )?;
+                for (class, model) in map {
+                    crate::fit::validate_class(class)
+                        .map_err(|e| format!("classModels.{class}: {e}"))?;
+                    let model = model
+                        .as_str()
+                        .ok_or_else(|| format!("classModels.{class}: model must be a string"))?;
+                    crate::models::validate_model(model)
+                        .map_err(|e| format!("classModels.{class}: {e}"))?;
+                }
+            }
+        }
         crate::deny::validate_config(value.get("agentDeny"), repo)?;
         if let Some(v) = value.get("measure") {
             let rules = v.as_array().ok_or("measure must be a list")?;
@@ -481,6 +497,8 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
         validate_fill_config(value.get("fill"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
         validate_hotspots_config(value.get("hotspots"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        validate_design_paths_config(value.get("designPaths"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
         crate::lines::validate_line_stats_config(value.get("lineStats"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -582,6 +600,29 @@ pub fn parse_hotspots_config(v: Option<&Value>) -> Vec<String> {
         .map(|s| s.trim().trim_start_matches("./").to_string())
         .filter(|s| !s.is_empty() && !s.contains('\0'))
         .collect()
+}
+
+/// Validate repository-only `designPaths` config: `["apps/ui-sandbox/"]`.
+pub fn validate_design_paths_config(v: Option<&Value>) -> Res<()> {
+    let Some(val) = v else {
+        return Ok(());
+    };
+    if val.is_null() {
+        return Ok(());
+    }
+    let Some(arr) = val.as_array() else {
+        return Err("designPaths must be an array of non-empty path strings".into());
+    };
+    for item in arr {
+        let Some(s) = item.as_str() else {
+            return Err("designPaths must contain only non-empty path strings".into());
+        };
+        let clean = s.trim().trim_start_matches("./");
+        if clean.is_empty() || s.contains('\0') {
+            return Err("designPaths contains an empty or invalid path".into());
+        }
+    }
+    Ok(())
 }
 
 /// Validate repository-only `areas` config for deterministic L0 experience A/B alternation:
@@ -757,6 +798,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
             "areas",
             "fill",
             "hotspots",
+            "designPaths",
             "lineStats",
         ] {
             if user.get(key).is_some() {
@@ -771,7 +813,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
     }
     let mut value = repo.clone().unwrap_or(json!({}));
     // Independent maps merge per key, repository overrides user.
-    for key in ["tiers", "models"] {
+    for key in ["tiers", "models", "classModels"] {
         let mut merged = user
             .as_ref()
             .and_then(|u| u[key].as_object().cloned())

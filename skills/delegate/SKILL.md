@@ -1,6 +1,6 @@
 ---
 name: delegate
-description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事是 Pi 或 Antigravity CLI（agy，登记为 agy/<模型> 的别名走它），按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名指定模型、默认 thinking 与价位 cost；fit 适配卡记录三类任务的质量与价位，新模型按同题重评。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；容量满会排队，重检查也限流。Use to delegate or parallelize work proactively to Pi or agy (Antigravity CLI) colleagues, and to get a second opinion, code review or image review from another model, judged by results.
+description: 把可独立验收的任务交给同事 Agent 在后台并行完成，你只收结果并把关。遇到这些情况时主动使用，不必等用户开口：要读很多文件但只需结论；改动前想要第二意见或独立审查；有两个以上互不依赖、能用命令验收的子任务；需要有人看截图或设计图给意见。同事是 Pi 或 Antigravity CLI（agy，登记为 agy/<模型> 的别名走它），按用途 scout（只读侦察）、review（只读严密审查）、write（写代码带验收）派发；也可用 models 别名与 classModels 指定模型、默认 thinking 与价位 cost；fit 适配卡记录四类任务（build/hard/review/design）的质量与价位，新模型按同题重评。脚本代跑验收命令，只给一行结论与下一步，过程不进主控上下文；容量满会排队，重检查也限流。Use to delegate or parallelize work proactively to Pi or agy (Antigravity CLI) colleagues, and to get a second opinion, code review or image review from another model, judged by results.
 license: MIT
 compatibility: Linux x86_64 或 aarch64；入口是安装时下载的静态二进制 bin/delegate，不需要 Python；需要 pi CLI（pi-kit 的 rpi 通道下 `pi` 即 rpi）。
 metadata:
@@ -38,7 +38,7 @@ $D land <run> -m "提交说明"                    # 后续命令用 && 不要�
 
 ## 规则
 
-1. 默认档位、思考深度、只读探路、基线同步与合入后清理都已自动选好，常规任务**不要传额外选项**；多行说明用 `--prompt-file -` 加 heredoc。
+1. 默认档位、思考深度、只读探路、基线同步与合入后清理都已自动选好，常规任务**不要传额外选项**；多行说明用 `--prompt-file -` 加 heredoc。设计稿任务用 `--class design`（或任务路径命中 `.delegate.json` `designPaths` 自动推断），默认 `high` 思考并优先走用户配置 `classModels.design`（定稿后产品实现仍走写入档默认模型）。
 2. 同事看不到你的上下文：写清目标、范围、验收命令和已知事实；看到 `提问` 状态用 `reply` 回答（不算返工）。
 3. `land`/`apply` 最后一行是结论，`FAILED（未合入）` 时按提示处理，不要在旧代码上跑测试；不要给 `land`/`apply` 套短 `timeout`。
 

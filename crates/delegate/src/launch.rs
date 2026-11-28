@@ -23,6 +23,9 @@ pub struct Options {
     pub overflow: Option<String>,
     pub thinking_cli: Option<String>,
     pub class: Option<String>,
+    pub class_inferred: bool,
+    pub class_model_picked: bool,
+    pub class_model_fallback: Option<String>,
     pub agent_pinned: bool,
     /// The model came from a tier rather than `--model` or the run being continued,
     /// so `launch` may pick again once it counts the machine's runs (`maxActive`).
@@ -482,11 +485,32 @@ fn require_models(config: &Value, listed: &[models::PiModel]) -> Res<Value> {
 }
 
 /// Thinking override from CLI `--thinking`, falling back to `--class` default thinking
-/// (`build|design|scout|review` -> `medium`, `hard` -> `high`) when no explicit `--thinking` was given.
+/// (`build|review` -> `medium`, `hard|design` -> `high`) when no explicit `--thinking` was given.
 fn effective_thinking_override(o: &Options) -> Option<&str> {
     o.thinking_cli
         .as_deref()
         .or_else(|| o.class.as_deref().and_then(crate::fit::default_thinking))
+}
+
+/// Infer `--class design` when no `--class` was passed and a repository path in the brief
+/// falls under `.delegate.json` `designPaths`. Only matches paths, never keywords.
+fn infer_design_class(prompt: &str, repo: &Path, config: &Value) -> bool {
+    let Some(prefixes) = config.get("designPaths").and_then(Value::as_array) else {
+        return false;
+    };
+    let prefixes: Vec<&str> = prefixes
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if prefixes.is_empty() {
+        return false;
+    }
+    let tokens = crate::brief_check::extract_repo_path_tokens(prompt, repo);
+    tokens
+        .iter()
+        .any(|cand| prefixes.iter().any(|pref| area_prefix_matches(cand, pref)))
 }
 
 /// Resolve explicit identity independently of purpose, then choose thinking.
@@ -494,16 +518,34 @@ fn apply_tier_model(o: &mut Options, config: &Value) -> Res<Value> {
     let listed = agents::pi_models();
     let models = require_models(config, &listed)?;
     let thinking_override = effective_thinking_override(o).map(str::to_string);
+    o.class_model_picked = false;
+    o.class_model_fallback = None;
     if o.agent_pinned {
         let name = o.model.as_deref().unwrap_or("");
         let model = models::resolve_model(name, config, &listed)?;
         o.model_name = Some(name.into());
         o.thinking = models::thinking(thinking_override.as_deref(), &json!(name), config)?;
         o.model = Some(model);
+    } else if let Some((class_name, configured)) = o.class.as_deref().and_then(|class| {
+        config
+            .get("classModels")
+            .and_then(|m| m.get(class))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|m| (class, m))
+    }) {
+        let model = models::resolve_model(configured, config, &listed)
+            .map_err(|e| format!("classModels.{class_name}: {e}"))?;
+        o.model_name = Some(configured.into());
+        o.thinking = models::thinking(thinking_override.as_deref(), &json!(configured), config)?;
+        o.model = Some(model);
+        o.class_model_picked = true;
+        o.tier_picked = false;
     } else {
+        let tier = o.tier.as_deref().unwrap_or("review");
         let pick = models::pick(
             config,
-            o.tier.as_deref().unwrap_or("review"),
+            tier,
             thinking_override.as_deref(),
             &listed,
             agents::local_clock(),
@@ -513,6 +555,12 @@ fn apply_tier_model(o: &mut Options, config: &Value) -> Res<Value> {
         o.model = Some(pick.model);
         o.thinking = pick.thinking;
         o.tier_picked = true;
+        if o.class.as_deref() == Some("design") {
+            let inferred_tag = if o.class_inferred { "（推断）" } else { "" };
+            o.class_model_fallback = Some(format!(
+                "类别 design{inferred_tag} 未配置 classModels.design，已退回 {tier} 档默认模型；可在 ~/.config/delegate/config.json 配置 classModels.design"
+            ));
+        }
     }
     Ok(models)
 }
@@ -1768,6 +1816,14 @@ pub fn start(mut o: Options) -> Res<PathBuf> {
     let config = crate::config::load(repo.as_deref())?;
     if let Some(warn) = crate::agy::agent_cost_warning(&config.value["agy"]) {
         eprintln!("{warn}");
+    }
+    if o.class.is_none() {
+        if let Some(repo_root) = repo.as_deref() {
+            if infer_design_class(&prompt, repo_root, &config.value) {
+                o.class = Some("design".into());
+                o.class_inferred = true;
+            }
+        }
     }
     let tier_models = apply_tier_model(&mut o, &config.value)?;
     let defaults = effective_defaults(&mut o, &config);
@@ -3445,8 +3501,16 @@ pub fn launch(
         .as_deref()
         .filter(|c| crate::fit::default_thinking(c).is_some())
     {
-        format!("类别 {class}")
-    } else if parent_path.is_some() && !o.tier_picked && !o.agent_pinned {
+        if o.class_inferred {
+            format!("类别 {class}（推断）")
+        } else {
+            format!("类别 {class}")
+        }
+    } else if parent_path.is_some()
+        && !o.tier_picked
+        && !o.agent_pinned
+        && !o.class_model_picked
+    {
         "原会话".into()
     } else {
         models::thinking_source(None, &rule, &extra["tierConfig"]).into()
@@ -3478,15 +3542,38 @@ pub fn launch(
                 ) + &format!("〔{source}〕")
             );
         }
-    } else if parent_path.is_some() && !o.tier_picked && !o.agent_pinned {
+    } else if parent_path.is_some()
+        && !o.tier_picked
+        && !o.agent_pinned
+        && !o.class_model_picked
+    {
         eprintln!("delegate: 沿用原会话的模型 {model_display}，thinking {level}");
     } else if o.agent_pinned {
-        eprintln!("delegate: 固定模型 {model_display}，thinking {level}（--model）");
+        if o.class_inferred {
+            eprintln!(
+                "delegate: 固定模型 {model_display}，thinking {level}（--model；类别 {}（推断））",
+                o.class.as_deref().unwrap_or("")
+            );
+        } else {
+            eprintln!("delegate: 固定模型 {model_display}，thinking {level}（--model）");
+        }
+    } else if o.class_model_picked {
+        let class_tag = if o.class_inferred {
+            format!("{}（推断）", o.class.as_deref().unwrap_or(""))
+        } else {
+            o.class.as_deref().unwrap_or("").to_string()
+        };
+        eprintln!(
+            "delegate: 类别 {class_tag}（classModels），模型 {model_display}，thinking {level}"
+        );
     } else {
         eprintln!(
             "delegate: {} 档，模型 {model_display}，thinking {level}",
             o.tier.as_deref().unwrap_or("")
         );
+    }
+    if let Some(fallback) = &o.class_model_fallback {
+        eprintln!("delegate: {fallback}");
     }
 
     if let Some(class) = &o.class {
@@ -3741,6 +3828,9 @@ pub fn launch(
     }
     if let Some(class) = &o.class {
         meta["class"] = json!(class);
+        if o.class_inferred {
+            meta["classInferred"] = json!(true);
+        }
     } else if !s(parent, "class").is_empty() {
         meta["class"] = parent["class"].clone();
     }

@@ -2,13 +2,13 @@
 use crate::common::*;
 use serde_json::{json, Value};
 
-pub const CLASSES: [&str; 3] = ["build", "hard", "review"];
+pub const CLASSES: [&str; 4] = ["build", "hard", "review", "design"];
 
 /// Default thinking level implied by `--class` when no explicit `--thinking` or `DELEGATE_THINKING` is set.
 pub fn default_thinking(class: &str) -> Option<&'static str> {
     match class {
         "build" | "review" => Some("medium"),
-        "hard" => Some("high"),
+        "hard" | "design" => Some("high"),
         _ => None,
     }
 }
@@ -19,9 +19,9 @@ pub(crate) fn path() -> std::path::PathBuf {
 pub fn validate_class(class: &str) -> Res<()> {
     if CLASSES.contains(&class) {
         Ok(())
-    } else if matches!(class, "scout" | "design") {
+    } else if class == "scout" {
         Err(format!(
-            "class '{class}' was removed; use build (spec'd implementation, incl. UI from the controller's design), hard (ledger/concurrency/sandbox/migration) or review (read-only review)"
+            "class '{class}' was removed; use build (spec'd implementation), hard (ledger/concurrency/sandbox/migration), review (read-only review) or design (design drafts)"
         ))
     } else {
         Err(format!("unknown class {class}; use {}", CLASSES.join("|")))
@@ -123,7 +123,7 @@ pub fn command(args: &[String]) -> Res<i32> {
     let aliases = aliases(&config.value);
     if args.first().is_some_and(|a| a == "set") {
         if args.len() != 5 && !(args.len() == 7 && args[5] == "--sample") {
-            return Err("use delegate fit set <build|hard|review> <alias> <first|ok|avoid> \"note\" [--sample FILE]".into());
+            return Err("use delegate fit set <build|hard|review|design> <alias> <first|ok|avoid> \"note\" [--sample FILE]".into());
         }
         validate_class(&args[1])?;
         if !aliases.contains(&args[2]) {
@@ -169,7 +169,7 @@ pub fn command(args: &[String]) -> Res<i32> {
             println!("{out}");
             return Ok(0);
         }
-        // Three rows only; compact each cell for wide model registries. Full notes
+        // Four rows only; compact each cell for wide model registries. Full notes
         // remain available through --json, without growing the summary vertically.
         let width = (100 / aliases.len().max(1)).clamp(10, 85);
         let headers = aliases
@@ -252,26 +252,25 @@ mod tests {
     }
 
     #[test]
-    fn default_thinking_matches_three_classes() {
+    fn default_thinking_matches_four_classes() {
         assert_eq!(default_thinking("build"), Some("medium"));
         assert_eq!(default_thinking("review"), Some("medium"));
         assert_eq!(default_thinking("hard"), Some("high"));
-        assert_eq!(default_thinking("design"), None);
+        assert_eq!(default_thinking("design"), Some("high"));
         assert_eq!(default_thinking("scout"), None);
         assert_eq!(default_thinking("other"), None);
     }
 
     #[test]
     fn removed_classes_error_message() {
-        for name in ["scout", "design"] {
-            let err = validate_class(name).unwrap_err();
-            assert_eq!(
-                err,
-                format!(
-                    "class '{name}' was removed; use build (spec'd implementation, incl. UI from the controller's design), hard (ledger/concurrency/sandbox/migration) or review (read-only review)"
-                )
-            );
-        }
-        assert!(validate_class("other").unwrap_err().contains("build|hard|review"));
+        let err = validate_class("scout").unwrap_err();
+        assert_eq!(
+            err,
+            "class 'scout' was removed; use build (spec'd implementation), hard (ledger/concurrency/sandbox/migration), review (read-only review) or design (design drafts)"
+        );
+        assert!(validate_class("design").is_ok());
+        assert!(validate_class("other")
+            .unwrap_err()
+            .contains("build|hard|review|design"));
     }
 }

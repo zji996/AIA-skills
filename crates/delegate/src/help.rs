@@ -32,7 +32,7 @@ const LAUNCH: &[(&str, &str)] = &[
     ("--review-model ALIAS", "Override the automatic reviewer model for this run (precedence: --review-model > repo review.model > user review.model > review tier). Falls back to review tier with a card notice if unavailable."),
     ("--review-full", "Force full net diff review on every review round of this run instead of incremental review or sync-round skip."),
     ("--overflow next|queue", "At model capacity: queue for the selected model (default), or explicitly allow the next tier candidate. Overrides rule overflow for this launch; pinned --model still queues."),
-    ("--class build|hard|review", "Select default thinking when --thinking is omitted (build|review -> medium, hard -> high) and show user-local fit card advice (delegate fit)."),
+    ("--class build|hard|review|design", "Select default thinking when --thinking is omitted (build|review -> medium, hard|design -> high), pick classModels.<class> when configured (unless --model is set), and show user-local fit card advice (delegate fit)."),
     ("--thinking LEVEL", "off|minimal|low|medium|high|xhigh. Environment > CLI > tier rule > alias thinking > config thinking > Pi default; independent of the model name."),
     ("--allow-parallel-writes", "Allow concurrent write runs in one workdir."),
     ("--worktree", "Write in a detached git worktree seeded from the current tree; merge with apply."),
@@ -196,7 +196,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "disk",
         "Check build-cache disk health (disk status) or run liveness-aware zero-cost cleanup and whole-disk global LRU pruning (disk prune [--dry-run] [--json]).",
     ),
-    ("fit", "Show or update the three-class model suitability & cost card (fit set; fit bench review; fit --json)."),
+    ("fit", "Show or update the four-class model suitability & cost card (fit set; fit bench review; fit --json)."),
     (
         "tiers",
         "Show purpose rules and registered aliases with Pi capabilities; configure --scout/--review/--write, --alias, --thinking.",
@@ -509,7 +509,7 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--json", "Print deletion counts, orphan container cleanup, and archive rescan results as JSON lines."),
         ]),
         "tiers" => ("[--scout ALIAS] [--review ALIAS] [--write ALIAS] [--alias NAME=provider/id] [--thinking LEVEL] [--json]", "Print each purpose's rules (alias, full id, thinking), registered aliases with cost tier (low|main|high|—) and Pi context/images/thinking capabilities, unregistered Pi model count, and advisory hints when review/scout costs more than write or write lacks a build fit record. Pass --json for structured output including hints. Settings validate and atomically update user config; --alias is repeatable. All three tiers must resolve for start/run/reply. Old tiers and model :thinking suffixes are unsupported: register aliases, configure the three purposes and move suffixes into thinking.", &[]),
-        "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE] | bench review ALIAS [--since 30d] [-n 10] [--estimate] [--yes] [--json]", "Three fixed classes (build/hard/review) plus each alias's configured cost tier (low|main|high|—); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes, samples, and cost. `fit bench review` replays historical runs with known review outcomes (missed/caught) on a candidate alias using archived snapshots, estimates cost first (--estimate or requires --yes), and records a summary note in fit.json.", &[
+        "fit" => ("[--json] | set CLASS ALIAS first|ok|avoid NOTE [--sample FILE] | bench review ALIAS [--since 30d] [-n 10] [--estimate] [--yes] [--json]", "Four fixed classes (build/hard/review/design) plus each alias's configured cost tier (low|main|high|—); user-local fit.json stores only the latest verdict per alias/class, with an 80-character one-line note. Setting first demotes the previous first to ok. Missing evaluations are listed; --json shows full notes, samples, and cost. `fit bench review` replays historical runs with known review outcomes (missed/caught) on a candidate alias using archived snapshots, estimates cost first (--estimate or requires --yes), and records a summary note in fit.json.", &[
             ("bench review ALIAS", "Replay historical write runs with known review outcomes against candidate ALIAS."),
             ("--since DURATION|all", "History window for bench sampling (default: 30d)."),
             ("-n N", "Maximum number of historical runs to sample (default: 10, balanced missed/caught)."),
