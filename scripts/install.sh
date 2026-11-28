@@ -5,14 +5,20 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SKILLS_SRC="$REPO_ROOT/skills"
 MARKER=".aia-skills-install"
 
+# Record whether ~/.gemini existed before install.sh creates any skill directories.
+HAD_GEMINI=0
+[ -d "$HOME/.gemini" ] && HAD_GEMINI=1
+
 # Shared directories and the agents that scan each of them.
 PRIMARY_DIRS=(
   "$HOME/.agents/skills"
   "$HOME/.claude/skills"
+  "$HOME/.gemini/config/skills"
 )
 declare -A READERS=(
   ["$HOME/.agents/skills"]="pi codex cursor kilo"
   ["$HOME/.claude/skills"]="claude"
+  ["$HOME/.gemini/config/skills"]="agy"
 )
 # Agent-specific directories, used only when a skill must skip a shared directory.
 declare -A OWN_DIR=(
@@ -127,6 +133,11 @@ if [ "$ACTION" = uninstall ]; then
     removed=$((removed + 1))
     echo "  [Removed] $entry"
   done < <(owned_entries)
+  if [ -f "$HOME/.gemini/config/hooks.json" ] && [ -x "$REPO_ROOT/scripts/install-agy-hooks.sh" ]; then
+    if [ ${#SELECTED_SKILLS[@]} -eq 0 ] || [[ " ${SELECTED_SKILLS[*]} " == *" delegate "* ]]; then
+      "$REPO_ROOT/scripts/install-agy-hooks.sh" --uninstall
+    fi
+  fi
   echo "Done! Removed $removed entries."
   exit 0
 fi
@@ -265,6 +276,16 @@ while IFS= read -r entry; do
   remove_entry "$entry"
   echo "  [Pruned] $entry (source skill no longer exists)"
 done < <(owned_entries)
+
+# When ~/.gemini already exists and delegate is installed, wire agy Stop/PreToolUse hooks.
+if [ "$HAD_GEMINI" -eq 1 ] && [ -x "$REPO_ROOT/scripts/install-agy-hooks.sh" ]; then
+  for skill in "${SELECTED_SKILLS[@]}"; do
+    if [ "$skill" = delegate ]; then
+      "$REPO_ROOT/scripts/install-agy-hooks.sh"
+      break
+    fi
+  done
+fi
 
 # Warm up delegate's state index and archive usage cache asynchronously on install/upgrade.
 if [ -z "${AIA_SKILLS_SKIP_BINARIES:-}" ]; then

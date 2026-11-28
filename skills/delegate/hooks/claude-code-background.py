@@ -690,6 +690,14 @@ CAPPED_BUILD_REASON = (
     "build's lock for an unpredictable time; the timeout kills a healthy wait and forces a rerun. Drop "
     "the timeout and run it with run_in_background: true (you are notified on exit); queue heavy builds "
     "with `delegate lane '<cmd>'`.")
+AGY_CAPPED_BUILD_REASON = (
+    "`{call}` 给编译/测试命令套了前台 timeout。cargo、pnpm 这类命令可能要排队等别的构建释放锁，"
+    "要等多久无法预估，时限一到就杀掉一个健康的等待，只能重跑。去掉 timeout，用 run_command 的 "
+    "WaitMsBeforeAsync: 500, IsDaemon: false 放后台运行（结束会自动唤醒），重的构建用 `delegate lane '<命令>'` 排队。 / "
+    "`{call}` wraps a build/test command in a foreground timeout. cargo/pnpm may queue behind another "
+    "build's lock for an unpredictable time; the timeout kills a healthy wait and forces a rerun. Drop "
+    "the timeout and run it with run_command (WaitMsBeforeAsync: 500, IsDaemon: false) so Reactive "
+    "Wakeup notifies you on exit; queue heavy builds with `delegate lane '<cmd>'`.")
 _SEGMENT_SPLIT = re.compile(r"(?:&&|\|\||[;|&(\n])")
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -780,6 +788,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return allow(fmt)
         if not is_bg:
+            capped = capped_build(command)
+            if capped:
+                return deny(AGY_CAPPED_BUILD_REASON.format(call=capped), fmt)
             poll_call = foreground_delegate_poll(command)
             if poll_call:
                 return deny(AGY_POLL_REASON, fmt)

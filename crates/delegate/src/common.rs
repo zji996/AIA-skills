@@ -30,16 +30,10 @@ pub const GUARDS: [&str; 7] = [
     "PI_DELEGATE_AGENT",
     "PI_DELEGATE_PARENT_RUN",
 ];
-/// Parent-controller session and Antigravity runtime variables stripped when launching
-/// colleagues so nested `agy` / Claude / Codex / Pi invocations never cross-talk with
-/// the parent controller's language server or session identity.
-pub const CONTROLLER_ENV: [&str; 10] = [
-    "ANTIGRAVITY_LS_ADDRESS",
-    "ANTIGRAVITY_CSRF_TOKEN",
-    "ANTIGRAVITY_CONVERSATION_ID",
-    "ANTIGRAVITY_TRAJECTORY_ID",
-    "ANTIGRAVITY_SOURCE_METADATA",
-    "ANTIGRAVITY_AGENT",
+/// Parent-controller session variables stripped when launching colleagues so nested
+/// Claude / Codex / Pi invocations never cross-talk with the parent session identity.
+/// Antigravity runtime variables (`ANTIGRAVITY_*`) are stripped by prefix in `clean_env`.
+pub const CONTROLLER_ENV: [&str; 4] = [
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
     "PI_SESSION_ID",
@@ -812,13 +806,35 @@ pub fn read_git_head(repo: &Path) -> Option<String> {
         None
     }
 }
+pub fn strip_antigravity_env(c: &mut Command) {
+    strip_antigravity_env_with_keys(c, env::vars_os().map(|(k, _)| k));
+}
+fn strip_antigravity_env_with_keys<I, S>(c: &mut Command, host_keys: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    for k in host_keys {
+        if k.as_ref().to_string_lossy().starts_with("ANTIGRAVITY_") {
+            c.env_remove(k.as_ref());
+        }
+    }
+}
 pub fn clean_env(c: &mut Command, extra: &Value) {
+    clean_env_with_keys(c, extra, env::vars_os().map(|(k, _)| k));
+}
+fn clean_env_with_keys<I, S>(c: &mut Command, extra: &Value, host_keys: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     for k in GUARDS {
         c.env_remove(k);
     }
     for k in CONTROLLER_ENV {
         c.env_remove(k);
     }
+    strip_antigravity_env_with_keys(c, host_keys);
     // Existing host env and config env.CARGO_BUILD_JOBS no longer take effect;
     // delegate injects the derived (or explicit heavyJobs) CARGO_BUILD_JOBS instead.
     c.env_remove("CARGO_BUILD_JOBS");
@@ -1542,7 +1558,22 @@ mod git_lock_tests {
     #[test]
     fn clean_env_strips_parent_controller_and_antigravity_vars() {
         let mut cmd = Command::new("true");
-        clean_env(&mut cmd, &serde_json::json!({"CUSTOM_KEEP": "yes"}));
+        let host_keys = [
+            "ANTIGRAVITY_LS_ADDRESS",
+            "ANTIGRAVITY_CSRF_TOKEN",
+            "ANTIGRAVITY_CONVERSATION_ID",
+            "ANTIGRAVITY_TRAJECTORY_ID",
+            "ANTIGRAVITY_SOURCE_METADATA",
+            "ANTIGRAVITY_AGENT",
+            "ANTIGRAVITY_APP_DATA_DIR",
+            "ANTIGRAVITY_PROJECT_ID",
+            "ANTIGRAVITY_AGENTAPI_EXE",
+            "ANTIGRAVITY_LS_VERSION",
+            "ANTIGRAVITY_FUTURE_CUSTOM",
+            "NOT_ANTIGRAVITY_VAR",
+            "HOME",
+        ];
+        clean_env_with_keys(&mut cmd, &serde_json::json!({"CUSTOM_KEEP": "yes"}), host_keys);
         let envs: HashMap<String, Option<String>> = cmd
             .get_envs()
             .map(|(k, v)| {
@@ -1555,6 +1586,23 @@ mod git_lock_tests {
         for key in CONTROLLER_ENV {
             assert_eq!(envs.get(key), Some(&None), "expected {key} to be removed");
         }
+        for key in [
+            "ANTIGRAVITY_LS_ADDRESS",
+            "ANTIGRAVITY_CSRF_TOKEN",
+            "ANTIGRAVITY_CONVERSATION_ID",
+            "ANTIGRAVITY_TRAJECTORY_ID",
+            "ANTIGRAVITY_SOURCE_METADATA",
+            "ANTIGRAVITY_AGENT",
+            "ANTIGRAVITY_APP_DATA_DIR",
+            "ANTIGRAVITY_PROJECT_ID",
+            "ANTIGRAVITY_AGENTAPI_EXE",
+            "ANTIGRAVITY_LS_VERSION",
+            "ANTIGRAVITY_FUTURE_CUSTOM",
+        ] {
+            assert_eq!(envs.get(key), Some(&None), "expected {key} to be removed by prefix");
+        }
+        assert!(!envs.contains_key("NOT_ANTIGRAVITY_VAR"));
+        assert!(!envs.contains_key("HOME"));
         assert_eq!(envs.get("CUSTOM_KEEP"), Some(&Some("yes".into())));
     }
 

@@ -35,7 +35,7 @@ errors = []
 skill_names = set()
 CHINESE_TRIGGER = re.compile(r"时(?:主动)?使用")
 ENGLISH_TRIGGER = re.compile(r"\buse (when|to|for)\b", re.I)
-KNOWN_AGENTS = {"pi", "codex", "cursor", "claude", "kilo"}
+KNOWN_AGENTS = {"pi", "codex", "cursor", "claude", "kilo", "agy"}
 
 for directory in sorted(skills.iterdir()):
     if not directory.is_dir():

@@ -2055,7 +2055,7 @@ fn adopt_command(args: &[String]) -> Res<i32> {
     }
     let Some((new_caller, new_source)) = caller_source() else {
         return Err(
-            "adopt requires an active caller session (DELEGATE_CALLER / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID)"
+            "adopt requires an active caller session (DELEGATE_CALLER / ANTIGRAVITY_CONVERSATION_ID / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID)"
                 .into(),
         );
     };

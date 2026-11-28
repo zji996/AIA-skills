@@ -208,6 +208,11 @@ class DelegateDiskHealthTests(unittest.TestCase):
         self.assertIn("stale-big", hk_doc.get("diskReminder", ""))
         self.assertTrue(stale_run.is_dir(), "Stop hook must NEVER auto-delete stale run")
 
+        # Agy Stop format must emit strictly `{}` when unblocked (never non-protocol `systemMessage`).
+        hk_agy = self.cli("hook", "check", "--format", "agy", "--cwd", str(repo))
+        self.assertEqual(hk_agy.returncode, 0, hk_agy.stderr)
+        self.assertEqual(json.loads(hk_agy.stdout), {})
+
     def test_disk_subcommands_fail_closed_on_invalid_config(self):
         repo = self.repo({"a.txt": "x\n"})
 

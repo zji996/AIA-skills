@@ -871,6 +871,7 @@ fn run_agy_usage_cmd(
     timeout_secs: u64,
 ) -> Result<(String, String), String> {
     let mut cmd = Command::new(agy_bin);
+    crate::common::strip_antigravity_env(&mut cmd);
     cmd.args(["-p", "/usage"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -7302,6 +7303,7 @@ fn cmd_add(args: &[String]) -> Res<i32> {
     }
 
     let mut cmd = Command::new(&agy_bin);
+    crate::common::strip_antigravity_env(&mut cmd);
     cmd.args(&login_args)
         .env("HOME", &temp_home.path)
         .env("XDG_CONFIG_HOME", temp_home.path.join(".config"))

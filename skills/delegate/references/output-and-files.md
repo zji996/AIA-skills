@@ -86,9 +86,9 @@
 | `DELEGATE_POLL` | `wait --progress`、4.4 之前的 run 与刚启动的 supervisor 的检查间隔秒数，默认 1；容量队每 100ms 复查，其余等待不轮询 |
 | `DELEGATE_PI_BIN` | 临时指定同事可执行文件；默认 PATH 上的 `pi`（Pi 或 rpi 由 pi-kit 通道定），续做沿用上一轮的 |
 | `DELEGATE_SCOUT_MODEL` / `DELEGATE_REVIEW_MODEL` / `DELEGATE_WRITE_MODEL` | 档位对应的 Pi 模型，覆盖配置 `tiers`；空值视为未设，回落到配置 |
-| `DELEGATE_AGENT` | 由脚本导出给同事（`pi`）；设有它的进程不能再委派 |
+| `DELEGATE_AGENT` | 由脚本导出给同事（`pi` / `agy`）；设有它的进程不能再委派 |
 | `PI_DELEGATE_ACTIVE` | 旧版标记，仍导出给 Pi；存在时视为 Pi 调用者 |
-| `DELEGATE_CALLER` | 主控会话标识，无参 `wait` 据此只收本会话的任务；未设时依次取 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`。`$D protocol` 显示当前取到的值与来源 |
+| `DELEGATE_CALLER` | 主控会话标识，无参 `wait` 据此只收本会话的任务；未设时依次取 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`PI_SESSION_ID`、`ANTIGRAVITY_CONVERSATION_ID`（`ANTIGRAVITY_AGENT` 激活时 `ANTIGRAVITY_CONVERSATION_ID` 优先）。`$D protocol` 显示当前取到的值与来源 |
 
 ## 代码结构
 

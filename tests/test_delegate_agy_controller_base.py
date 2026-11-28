@@ -32,6 +32,11 @@ CONTROLLER_STRIPPED_VARS = (
     "ANTIGRAVITY_TRAJECTORY_ID",
     "ANTIGRAVITY_SOURCE_METADATA",
     "ANTIGRAVITY_AGENT",
+    "ANTIGRAVITY_APP_DATA_DIR",
+    "ANTIGRAVITY_PROJECT_ID",
+    "ANTIGRAVITY_AGENTAPI_EXE",
+    "ANTIGRAVITY_LS_VERSION",
+    "ANTIGRAVITY_FUTURE_CUSTOM",
     "CLAUDE_CODE_SESSION_ID",
     "CODEX_THREAD_ID",
     "PI_SESSION_ID",
@@ -171,6 +176,11 @@ class DelegateAgyControllerBaseTests(unittest.TestCase):
             "ANTIGRAVITY_TRAJECTORY_ID": "agy-parent-traj",
             "ANTIGRAVITY_SOURCE_METADATA": "parent-meta",
             "ANTIGRAVITY_AGENT": "1",
+            "ANTIGRAVITY_APP_DATA_DIR": "/tmp/parent-app-data",
+            "ANTIGRAVITY_PROJECT_ID": "parent-project-123",
+            "ANTIGRAVITY_AGENTAPI_EXE": "/usr/local/bin/agentapi",
+            "ANTIGRAVITY_LS_VERSION": "1.5.19",
+            "ANTIGRAVITY_FUTURE_CUSTOM": "future-val",
             "CLAUDE_CODE_SESSION_ID": "claude-parent",
             "CODEX_THREAD_ID": "codex-parent",
             "PI_SESSION_ID": "pi-parent",
@@ -186,7 +196,7 @@ class DelegateAgyControllerBaseTests(unittest.TestCase):
         for line in dumped_pi.read_text(encoding="utf-8").splitlines():
             if "=" in line:
                 k, v = line.split("=", 1)
-                if k in CONTROLLER_STRIPPED_VARS:
+                if k in CONTROLLER_STRIPPED_VARS or k.startswith("ANTIGRAVITY_"):
                     leaked_pi[k] = v
         self.assertEqual(leaked_pi, {}, f"parent controller env leaked to pi colleague: {leaked_pi}")
 
@@ -224,7 +234,7 @@ class DelegateAgyControllerBaseTests(unittest.TestCase):
         for line in dumped_agy.read_text(encoding="utf-8").splitlines():
             if "=" in line:
                 k, v = line.split("=", 1)
-                if k in CONTROLLER_STRIPPED_VARS:
+                if k in CONTROLLER_STRIPPED_VARS or k.startswith("ANTIGRAVITY_"):
                     leaked_agy[k] = v
         self.assertEqual(leaked_agy, {}, f"parent controller env leaked to agy colleague: {leaked_agy}")
 
@@ -453,7 +463,15 @@ class DelegateAgyControllerBaseTests(unittest.TestCase):
         self.assertEqual(mixed["decision"], "deny")
         self.assertIn("把 wait 单独作为一条后台命令发出", mixed["reason"])
 
-        # Hard guards: foreground delegate poll, pgrep -f, git prune / gc --prune=now
+        # Hard guards: foreground capped build, foreground delegate poll, pgrep -f, git prune / gc --prune=now
+        t = "time" + "out"
+        for bad_kwargs in ({"wait_ms": 5000}, {"wait_ms": None}, {"wait_ms": 500, "is_daemon": True}):
+            cap = run_agy(f"{t} 30 cargo test", **bad_kwargs)
+            self.assertEqual(cap["decision"], "deny", bad_kwargs)
+            self.assertIn("WaitMsBeforeAsync: 500, IsDaemon: false", cap["reason"])
+            self.assertNotIn("run_in_background", cap["reason"])
+        self.assertEqual(run_agy(f"{t} 30 cargo test", wait_ms=500)["decision"], "allow")
+
         poll = run_agy("until [ -f .local/run/delegate/r1/exit_code ]; do sleep 5; done", wait_ms=5000)
         self.assertEqual(poll["decision"], "deny")
         self.assertIn("WaitMsBeforeAsync: 500", poll["reason"])

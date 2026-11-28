@@ -21,6 +21,7 @@ RELEASE = ROOT / "scripts/release-binary.sh"
 VERIFY = ROOT / "scripts/verify.sh"
 INSTALL_HOOKS = ROOT / "scripts/install-git-hooks.sh"
 INSTALL_CLAUDE_HOOKS = ROOT / "scripts/install-claude-hooks.sh"
+INSTALL_AGY_HOOKS = ROOT / "scripts/install-agy-hooks.sh"
 BOOTSTRAP = ROOT / "scripts/bootstrap.sh"
 SNAPSHOT = ROOT / "skills/agent-handoff/scripts/handoff-snapshot.sh"
 AUDIT = ROOT / "skills/repo-governance/scripts/audit-context.py"
@@ -1344,6 +1345,121 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(stop_cmds3, ["echo unrelated-stop"])
         pre_cmds3 = [h["command"] for entry in data3["hooks"]["PreToolUse"] for h in entry.get("hooks", [])]
         self.assertEqual(pre_cmds3, ["echo unrelated-pre"])
+
+    def test_install_agy_hooks_is_idempotent_backs_up_and_preserves_user_hooks(self):
+        hooks = self.work / "agy-hooks.json"
+        original = json.dumps({
+            "lint-checker": {
+                "PostToolUse": [
+                    {"matcher": "run_command", "hooks": [{"type": "command", "command": "./lint.sh"}]}
+                ]
+            },
+            "delegate": {
+                "Stop": [{"type": "command", "command": "old delegate hook check --format agy"}],
+                "PostToolUse": [
+                    {"matcher": "run_command", "hooks": [{"type": "command", "command": "echo keep-extra"}]}
+                ],
+            },
+        }, indent=2) + "\n"
+        hooks.write_text(original, encoding="utf-8")
+
+        first = self.run_script(INSTALL_AGY_HOOKS, "--hooks", hooks)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        backup = hooks.with_name(hooks.name + ".bak")
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_text(encoding="utf-8"), original)
+
+        data = json.loads(hooks.read_text(encoding="utf-8"))
+        self.assertIn("lint-checker", data)
+        self.assertEqual(data["lint-checker"]["PostToolUse"][0]["hooks"][0]["command"], "./lint.sh")
+        self.assertIn("PostToolUse", data["delegate"])
+        stop_entries = data["delegate"]["Stop"]
+        self.assertEqual(len(stop_entries), 1)
+        self.assertEqual(stop_entries[0]["type"], "command")
+        self.assertIn("hook check --format agy", stop_entries[0]["command"])
+        pre_entries = data["delegate"]["PreToolUse"]
+        self.assertEqual(len(pre_entries), 1)
+        self.assertEqual(pre_entries[0]["matcher"], "run_command")
+        self.assertIn("claude-code-background.py", pre_entries[0]["hooks"][0]["command"])
+        self.assertIn("--format agy", pre_entries[0]["hooks"][0]["command"])
+
+        # Running again is idempotent and does not clobber the original .bak backup.
+        second = self.run_script(INSTALL_AGY_HOOKS, "--hooks", hooks)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertEqual(backup.read_text(encoding="utf-8"), original)
+        data2 = json.loads(hooks.read_text(encoding="utf-8"))
+        self.assertEqual(len(data2["delegate"]["Stop"]), 1)
+        self.assertEqual(len(data2["delegate"]["PreToolUse"]), 1)
+
+        # --uninstall removes delegate Stop/PreToolUse while preserving user hooks and extra events.
+        removed = self.run_script(INSTALL_AGY_HOOKS, "--hooks", hooks, "--uninstall")
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        data3 = json.loads(hooks.read_text(encoding="utf-8"))
+        self.assertIn("lint-checker", data3)
+        self.assertNotIn("Stop", data3["delegate"])
+        self.assertNotIn("PreToolUse", data3["delegate"])
+        self.assertIn("PostToolUse", data3["delegate"])
+
+        # Fresh file: --stop-only writes only Stop, and --uninstall removes the whole "delegate" key.
+        fresh = self.work / "fresh-agy-hooks.json"
+        self.assertEqual(self.run_script(INSTALL_AGY_HOOKS, "--hooks", fresh, "--stop-only").returncode, 0)
+        fresh_data = json.loads(fresh.read_text(encoding="utf-8"))
+        self.assertIn("Stop", fresh_data["delegate"])
+        self.assertNotIn("PreToolUse", fresh_data["delegate"])
+        self.assertEqual(self.run_script(INSTALL_AGY_HOOKS, "--hooks", fresh, "--uninstall").returncode, 0)
+        self.assertEqual(json.loads(fresh.read_text(encoding="utf-8")), {})
+
+    def test_install_manages_agy_skills_and_hooks_when_gemini_exists(self):
+        # Without pre-existing ~/.gemini: skills are linked into ~/.gemini/config/skills, hooks.json is NOT created.
+        home_plain = self.work / "home-no-gemini"
+        env_plain = {**os.environ, "HOME": str(home_plain)}
+        res_plain = self.run_script(INSTALL, "delegate", "repo-governance", env=env_plain)
+        self.assertEqual(res_plain.returncode, 0, res_plain.stdout + res_plain.stderr)
+        self.assertEqual((home_plain / ".gemini/config/skills/delegate").resolve(), ROOT / "skills/delegate")
+        self.assertEqual((home_plain / ".gemini/config/skills/repo-governance").resolve(), ROOT / "skills/repo-governance")
+        self.assertFalse((home_plain / ".gemini/config/hooks.json").exists())
+
+        # With pre-existing ~/.gemini: install.sh wires hooks.json and --uninstall cleanly removes them.
+        home_agy = self.work / "home-with-gemini"
+        hooks_path = home_agy / ".gemini/config/hooks.json"
+        hooks_path.parent.mkdir(parents=True)
+        hooks_path.write_text(json.dumps({"user-hook": {"Stop": [{"type": "command", "command": "true"}]}}) + "\n")
+        env_agy = {**os.environ, "HOME": str(home_agy)}
+        res_agy = self.run_script(INSTALL, "delegate", env=env_agy)
+        self.assertEqual(res_agy.returncode, 0, res_agy.stdout + res_agy.stderr)
+        self.assertEqual((home_agy / ".gemini/config/skills/delegate").resolve(), ROOT / "skills/delegate")
+        hooks_after = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertIn("user-hook", hooks_after)
+        self.assertIn("delegate", hooks_after)
+        self.assertIn("Stop", hooks_after["delegate"])
+        self.assertIn("PreToolUse", hooks_after["delegate"])
+
+        res_un = self.run_script(INSTALL, "--uninstall", "delegate", env=env_agy)
+        self.assertEqual(res_un.returncode, 0, res_un.stdout + res_un.stderr)
+        self.assertFalse((home_agy / ".gemini/config/skills/delegate").is_symlink())
+        hooks_un = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertIn("user-hook", hooks_un)
+        self.assertNotIn("delegate", hooks_un)
+
+        # exclude-agents: agy is accepted by check.sh and skipped from ~/.gemini/config/skills.
+        mini_repo = self.work / "mini-agy-exclude"
+        (mini_repo / "scripts").mkdir(parents=True)
+        shutil.copy2(INSTALL, mini_repo / "scripts/install.sh")
+        shutil.copy2(CHECK, mini_repo / "scripts/check.sh")
+        (mini_repo / "skills/no-agy").mkdir(parents=True)
+        (mini_repo / "evals").mkdir()
+        (mini_repo / "evals/no-agy.md").write_text("# no-agy\n")
+        (mini_repo / "README.md").write_text("| **`no-agy`** | `skills/no-agy/` | test |\n")
+        (mini_repo / "skills/no-agy/SKILL.md").write_text(
+            "---\nname: no-agy\ndescription: 测试时使用。Use when testing.\n"
+            "metadata:\n  version: \"1.0.0\"\n  exclude-agents: agy\n---\n"
+        )
+        self.assertEqual(self.run_script(mini_repo / "scripts/check.sh").returncode, 0)
+        home_ex = self.work / "home-ex-agy"
+        res_ex = self.run_script(mini_repo / "scripts/install.sh", "no-agy", env={**os.environ, "HOME": str(home_ex)})
+        self.assertEqual(res_ex.returncode, 0, res_ex.stdout + res_ex.stderr)
+        self.assertEqual((home_ex / ".claude/skills/no-agy").resolve(), mini_repo / "skills/no-agy")
+        self.assertFalse((home_ex / ".gemini/config/skills/no-agy").exists())
 
 
 if __name__ == "__main__":

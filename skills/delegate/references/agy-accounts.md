@@ -67,6 +67,7 @@
 }
 ```
 
+- **agy 当主控时统一用 `delegate agy account use auto`**：正在跑的 `agy` 主控进程直接使用实盘 `~/.gemini`（不走覆盖层），而 `auto` 模式下委派同事全部走进程私有覆盖层按池自动选号、绝不改动实盘 `~/.gemini`。**运行期间切勿执行 `delegate agy account use <固定号>`**：这会把实盘 `~/.gemini` 切到新号 B，但仍在运行的原主控 A 在 OAuth 令牌刷新时会把 A 的新令牌回写实盘，静默覆盖刚切好的 B。
 - **不改实盘凭据，按池独立指针**：`auto` 模式下仅决定每次新会话的凭据覆盖层，绝不改动 `~/.gemini` 实盘凭据。每个模型池（`gemini` / `claude_gpt`）在 `<state>/agy-auto-switch.json` 持久化各自当前号指针（初值 = 实盘活跃号）；手动执行 `delegate agy account use <id>` 会切回固定号并把各池指针同步为 `<id>`。未知模型沿用实盘活跃号（避开 0% 槽位）且不覆写池指针。
 - **三档严格升档滞回 + 并发预扣**：
   - 有效 5h = `缓存 5h − perRunReservePct × 该号该池当前在跑写手数`（防 15 分钟盲窗内多路并发挤爆余量）。
@@ -108,7 +109,7 @@ for h in $HOSTS; do
       ssh "$h" "mkdir -p ~/$(dirname "$f")" && scp -q "$f" "$h:$f.new" && ssh "$h" "chmod 755 ~/$f.new && mv -f ~/$f.new ~/$f"
     fi
   done
-  echo "$h: $(ssh "$h" 'bash -lc "agy --version"; ~/.claude/skills/delegate/bin/delegate --version; jq -r ".model + \" \" + .toolPermission" ~/.gemini/antigravity-cli/settings.json' | tr '\n' ' ')"
+  echo "$h: $(ssh "$h" 'bash -lc "agy --version"; ~/'"$DEL"' --version; jq -r ".model + \" \" + .toolPermission" ~/.gemini/antigravity-cli/settings.json' | tr '\n' ' ')"
 done
 ```
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：补齐 agy 当主控的接线、安装、小修与文档——新增 `scripts/install-agy-hooks.sh`（幂等写入/移除 `~/.gemini/config/hooks.json` 的 `Stop` 与 `PreToolUse` 钩子，写前备份并保留用户已有条目），`scripts/install.sh` 纳入 `~/.gemini/config/skills/`（遵循 `exclude-agents`，`scripts/check.sh` 加入 `agy`）并在检测到 `~/.gemini` 时联动装卸 agy hooks；`clean_env`（及 agy 隔离启动）改为按前缀清除全部 `ANTIGRAVITY_*` 变量；`hook check --format agy` 无阻断时固定输出 `{}` 不输出非协议 `systemMessage`；`claude-code-background.py` 的 agy 分支补齐 `capped_build` 检查并给出 `WaitMsBeforeAsync: 500, IsDaemon: false` 提示；同步更新 `adopt` 报错/帮助与 `SKILL.md`、`configuration.md`、`output-and-files.md`、`long-run.md`、`agy-accounts.md`。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.60.0 - 2026-11-28

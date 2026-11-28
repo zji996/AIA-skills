@@ -25,7 +25,7 @@ $D start --read-only "说明目标与需要核实的结论"
 # 2. 改代码（隔离 worktree + 验收命令）
 $D start --worktree --accept "测试命令" "说明目标、改动范围与已知事实"
 
-# 3. 放后台等结果（agy 用 run_command 设 WaitMsBeforeAsync=500；幂等可重入，勿手写 while/sleep 轮询）
+# 3. 放后台等结果（agy 用 run_command 设 WaitMsBeforeAsync=500, IsDaemon=false；幂等可重入，勿手写 while/sleep 轮询）
 $D wait
 
 # 4. 追问 / 回答提问 / 返工（运行中直接追加，已结束自动续接）

@@ -69,7 +69,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 启动时在 `agent-shims/` 生成 shell shim 并插入同事 PATH 前端（reply 继承）；命中输出 hint 到 stderr 并退出 77，未命中透传 exec。同事的 `lane` 同样继承 shim PATH。`denied.log` 累计次数，结论记 `denied: N`；进程匹配三个 shim 始终生成。验收、证据、setup、生成核对、apply 与主控 `lane` 不注入 shim。威胁模型是防误用，非安全沙箱。
 
 - `stall`：`{"idle":"30m","command":"90m","accept":"10m"}`，`"0"` 关闭；`DELEGATE_STALL_IDLE`/`COMMAND`/`ACCEPT` 优先，均只发 `stall_warning` 不杀进程。
-- `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 使用 50m，其它调用方不设默认。
+- `checkIn`：wait 检查线时长，`"0"` 关闭；`DELEGATE_CHECK_IN` 优先。未设置时 Claude Code 与 agy（`ANTIGRAVITY_CONVERSATION_ID`）使用 50m，其它调用方不设默认。
 - `agy`：`{"agent":"<名>"}` 为 agy 同事附加 `--agent <名>`（新会话、续做与 `probe` 生效），名称非空且无空白/控制字符，未设不变。agy 1.5.17 起自定义 agent 的对话按更高费率扣额度（上游实测约 4 倍，官方称有意为之），默认不设；同事规则写进 `~/.gemini/GEMINI.md`。
 - `review`（默认关）：`true` 或 `{"enabled"?,"tier"?:"review"|"scout","model"?,"thinking"?,"rubric"?,"extra"?}`（仓库按字段覆盖用户）。模型按 `--review-model` > 仓库 > 用户 > review 档选，快层过与慢层并行审查（[review-rubric.md](review-rubric.md)），`review.extra` 命中条件且额度够时并行给第二意见，详见 [review-card.md](review-card.md)。
 - `acceptRules` / `riskRules`（可选，向后兼容单条 `accept`）：按路径分快/慢验收层与定制审查卡风险/体量预算规则，详见 [review-card.md](review-card.md)。

@@ -565,7 +565,7 @@ fn command_spec(command: &str) -> Option<CommandSpec> {
             ("--all", "Include all repositories instead of scoping to the current repository."),
             ("--json", "Print structured ETA JSON."),
         ]),
-        "adopt" => ("<run>... [--json]", "Transfer one or more runs (and every round in each run's reply/continuation chain) to the current caller session (DELEGATE_CALLER / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID) and emit an `adopted` event. Useful after `/clear` in Claude Code.", &[
+        "adopt" => ("<run>... [--json]", "Transfer one or more runs (and every round in each run's reply/continuation chain) to the current caller session (DELEGATE_CALLER / ANTIGRAVITY_CONVERSATION_ID / CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID / PI_SESSION_ID) and emit an `adopted` event. Useful after `/clear` in Claude Code or starting a new conversation in agy.", &[
             ("--json", "Print adopted chain metadata as JSON lines."),
         ]),
         "mark-applied" => ("<run> [--commit <sha>] [--check-files] [--json]", "Record a run (and unapplied same-worktree ancestors) as manually applied after resolving conflicts or committing outside `delegate apply`. Verifies the commit exists in the source repository (defaulting to source HEAD).", &[

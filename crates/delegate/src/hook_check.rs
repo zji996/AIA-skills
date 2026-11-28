@@ -4281,11 +4281,7 @@ pub fn check_cmd(args: &[String]) -> Res<i32> {
                 }
             }
             HookFormat::Agy => {
-                if let Some(ref note) = disk_note {
-                    println!("{}", json!({ "systemMessage": note }));
-                } else {
-                    println!("{{}}");
-                }
+                println!("{{}}");
             }
             HookFormat::Json => {
                 let mut doc = json!({
