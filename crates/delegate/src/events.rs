@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 /// Event kinds that require controller attention and trigger the Stop hook race lock
 /// when unread past the controller's cursor.
-pub const ALERT_KINDS: [&str; 12] = [
+pub const ALERT_KINDS: [&str; 13] = [
     "delivered",
     "question",
     "rejected",
@@ -25,6 +25,7 @@ pub const ALERT_KINDS: [&str; 12] = [
     "work_ready",
     "work_defer_expired",
     "work_stale",
+    "owner_drop",
 ];
 
 /// Whether an event record requires controller attention for cursor advancement & Stop hook.
@@ -1369,6 +1370,17 @@ pub fn format_human(ev: &Value) -> String {
                 format!("开始串行合入（{cnt} 个 run）")
             } else {
                 format!("开始串行合入（{cnt} 个 run，基线 {short}）")
+            }
+        }
+        "owner_drop" => {
+            let path = s(p, "path");
+            let size = p["size"].as_u64().unwrap_or(0);
+            let sz = crate::owner_drop::format_size_human(size);
+            let matched = strings(&p["matchedIds"]);
+            if !matched.is_empty() {
+                format!("交接目录新文件 {path}（{sz}，可能对应 {}）", matched.join("、"))
+            } else {
+                format!("交接目录新文件 {path}（{sz}）")
             }
         }
         "merge_item" => {

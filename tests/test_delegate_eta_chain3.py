@@ -262,6 +262,8 @@ class DelegateEtaChain3Tests(unittest.TestCase):
                 str(repo),
                 "--class",
                 "feat",
+                "--brief",
+                "docs/w2.md",
                 "--after-applied",
                 w1["id"],
                 "--json",
@@ -278,6 +280,8 @@ class DelegateEtaChain3Tests(unittest.TestCase):
                 str(repo),
                 "--class",
                 "infra",
+                "--brief",
+                "docs/w3.md",
                 "--after-time",
                 future_iso,
                 "--json",
@@ -358,12 +362,12 @@ class DelegateEtaChain3Tests(unittest.TestCase):
         repo = self.make_repo()
         self.seed_events(repo, count=12, base_dur=1200, cls="build")
 
-        w1 = json.loads(self.cli("work", "add", "步骤一底座", "--repo", str(repo), "--class", "feat", "--json", cwd=repo).stdout)
+        w1 = json.loads(self.cli("work", "add", "步骤一底座", "--repo", str(repo), "--class", "feat", "--brief", "docs/s1.md", "--json", cwd=repo).stdout)
         w2 = json.loads(
-            self.cli("work", "add", "步骤二引擎", "--repo", str(repo), "--class", "feat", "--after-applied", w1["id"], "--json", cwd=repo).stdout
+            self.cli("work", "add", "步骤二引擎", "--repo", str(repo), "--class", "feat", "--brief", "docs/s2.md", "--after-applied", w1["id"], "--json", cwd=repo).stdout
         )
         w3 = json.loads(
-            self.cli("work", "add", "步骤三展示", "--repo", str(repo), "--class", "feat", "--after-applied", w2["id"], "--json", cwd=repo).stdout
+            self.cli("work", "add", "步骤三展示", "--repo", str(repo), "--class", "feat", "--brief", "docs/s3.md", "--after-applied", w2["id"], "--json", cwd=repo).stdout
         )
 
         card = self.cli("work", "show", w3["id"], cwd=repo, human=True)
@@ -483,7 +487,7 @@ class DelegateEtaChain3Tests(unittest.TestCase):
             self.cli("work", "add", "在跑链头", "--repo", str(repo), "--class", "feat", "--run", slow_id, "--json", cwd=repo).stdout
         )
         w2 = json.loads(
-            self.cli("work", "add", "下游链尾", "--repo", str(repo), "--class", "feat", "--after-applied", w1["id"], "--json", cwd=repo).stdout
+            self.cli("work", "add", "下游链尾", "--repo", str(repo), "--class", "feat", "--brief", "docs/tail.md", "--after-applied", w1["id"], "--json", cwd=repo).stdout
         )
 
         # Capture current event cursor before releasing fast-done

@@ -767,7 +767,8 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         .map(crate::pulse::ActiveAlert::to_json)
         .collect();
 
-    let payload = json!({
+    let drop_snap = crate::owner_drop::inspect_readonly(&state, &unified_work.items, root.as_deref());
+    let mut payload = json!({
         "schemaVersion": SCHEMA_VERSION,
         "generatedAt": iso(),
         "seq": seq,
@@ -788,6 +789,20 @@ pub fn snapshot_command(args: &[String]) -> Res<i32> {
         "eta": eta_summary,
         "diskHealth": disk_health.to_json(),
     });
+    if !drop_snap.pending.is_empty() {
+        payload["ownerDrops"] = json!(drop_snap
+            .pending
+            .iter()
+            .map(|d| d.to_json())
+            .collect::<Vec<_>>());
+    }
+    if !drop_snap.diagnostics.is_empty() {
+        payload["ownerDropWarnings"] = json!(drop_snap
+            .diagnostics
+            .iter()
+            .map(|d| d.to_json())
+            .collect::<Vec<_>>());
+    }
     println!("{payload}");
     Ok(0)
 }

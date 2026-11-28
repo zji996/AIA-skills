@@ -500,8 +500,15 @@ pub fn validate(value: &Value, path: &Path, repo: bool) -> Res<()> {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         validate_design_paths_config(value.get("designPaths"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        validate_owner_drop_config(value.get("ownerDrop"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         crate::lines::validate_line_stats_config(value.get("lineStats"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+    } else if value.get("ownerDrop").is_some() {
+        return Err(format!(
+            "{}: ownerDrop is only allowed in repository .delegate.json",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -623,6 +630,110 @@ pub fn validate_design_paths_config(v: Option<&Value>) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Validate a repository-relative drop path (used by `.delegate.json` `ownerDrop` and `--drop-path`).
+/// Rejects empty strings, NUL/newlines, absolute paths, and any `..` traversal segment.
+/// Returns normalized relative path without leading `./` or trailing `/`.
+pub fn validate_relative_drop_path(raw: &str, field_name: &str) -> Res<String> {
+    if raw.contains(['\0', '\n', '\r']) {
+        return Err(format!("{field_name} contains invalid control characters"));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field_name} contains an empty path"));
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') || Path::new(trimmed).is_absolute() {
+        return Err(format!(
+            "{field_name} must be a relative path (got absolute path '{trimmed}')"
+        ));
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in trimmed.split(['/', '\\']) {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                return Err(format!(
+                    "{field_name} must not contain '..' path segments (got '{trimmed}')"
+                ));
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!("{field_name} contains an empty or '.' path"));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Validate repository-only `ownerDrop` config: `["tmp/"]`.
+pub fn validate_owner_drop_config(v: Option<&Value>) -> Res<()> {
+    let Some(val) = v else {
+        return Ok(());
+    };
+    if val.is_null() {
+        return Ok(());
+    }
+    let Some(arr) = val.as_array() else {
+        return Err("ownerDrop must be an array of non-empty relative path strings".into());
+    };
+    for item in arr {
+        let Some(s) = item.as_str() else {
+            return Err("ownerDrop must contain only non-empty relative path strings".into());
+        };
+        validate_relative_drop_path(s, "ownerDrop")?;
+    }
+    Ok(())
+}
+
+/// Parse repository-level `ownerDrop` paths (normalized relative paths without trailing `/`, deduplicated).
+pub fn parse_owner_drop_config(v: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in v.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(raw) = item.as_str() {
+            if let Ok(norm) = validate_relative_drop_path(raw, "ownerDrop") {
+                if !out.contains(&norm) {
+                    out.push(norm);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read repository-level `ownerDrop` entries directly from `<repo>/.delegate.json` (zero locks, zero git).
+pub fn load_repo_owner_drop(repo_root: &Path) -> Vec<String> {
+    if repo_root.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let cfg_path = repo_root.join(".delegate.json");
+    let Ok(Some(val)) = read_file(&cfg_path) else {
+        return Vec::new();
+    };
+    parse_owner_drop_config(val.get("ownerDrop"))
+}
+
+/// Read the first configured `ownerDrop` entry formatted for display (e.g. `tmp/`), or `None` if unconfigured.
+pub fn load_repo_owner_drop_first_display(repo_root: &Path) -> Option<String> {
+    if repo_root.as_os_str().is_empty() {
+        return None;
+    }
+    let cfg_path = repo_root.join(".delegate.json");
+    let Ok(Some(val)) = read_file(&cfg_path) else {
+        return None;
+    };
+    for item in val.get("ownerDrop").and_then(Value::as_array).into_iter().flatten() {
+        if let Some(raw) = item.as_str() {
+            if let Ok(norm) = validate_relative_drop_path(raw, "ownerDrop") {
+                return if raw.trim().ends_with('/') {
+                    Some(format!("{norm}/"))
+                } else {
+                    Some(norm)
+                };
+            }
+        }
+    }
+    None
 }
 
 /// Validate repository-only `areas` config for deterministic L0 experience A/B alternation:
@@ -799,6 +910,7 @@ pub fn load(top: Option<&Path>) -> Res<Config> {
             "fill",
             "hotspots",
             "designPaths",
+            "ownerDrop",
             "lineStats",
         ] {
             if user.get(key).is_some() {

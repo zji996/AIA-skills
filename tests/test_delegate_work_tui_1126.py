@@ -76,10 +76,10 @@ class DelegateWorkAndTui1126Tests(unittest.TestCase):
 
         # Add 1 ready item + 1 deferred item (far future).
         w_ready = json.loads(
-            self.cli("work", "add", "就绪测试项", "--repo", str(repo), "--class", "feat", "--json", cwd=repo).stdout
+            self.cli("work", "add", "就绪测试项", "--repo", str(repo), "--class", "feat", "--brief", "docs/ready.md", "--json", cwd=repo).stdout
         )
         w_def = json.loads(
-            self.cli("work", "add", "远期暂缓项", "--repo", str(repo), "--class", "feat", "--json", cwd=repo).stdout
+            self.cli("work", "add", "远期暂缓项", "--repo", str(repo), "--class", "feat", "--brief", "docs/def.md", "--json", cwd=repo).stdout
         )
         self.assertEqual(
             self.cli(

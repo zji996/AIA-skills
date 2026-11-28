@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `delegate`：新增仓库级 `ownerDrop` 交接目录与 Q 项可选 `--drop-path` 的纯元数据（`lstat`、零内容读取、不跟随符号链接、无深度/文件数上限，≥1000 文件在 `status` 提醒一行）投递感知，首次静默建基线，只读层（`hook check`/`hook pending`/`work [--owner]`/`snapshot --json`）零锁实时可见、写层落盘 `owner_drop` 事件并按高置信匹配自动唤醒 `deferred` 所有者项；Stop hook 新增 `OwnerDrop` 提醒（挡下游升 Tier 2），支持 `work close/drop <Qxx>` 自动确认、新增 `work ack-drop [<path>|--all] [--repo <目录>]` 与 `events --since` 消费闭环；配置 `ownerDrop`/`--drop-path` 的 `act` 项在 `work show` 与 `work --owner` 展示交付位置；`--verify-on` 新增 `human:<文字>` 并打通无运行无说明项直入 `verify` 态；无 `--brief` 且无 `--auto`/无 `runs` 的非所有者项不再计入写链 ETA 或引导 `delegate start`；同步修复 `work wait` 参数格式严格校验（拒绝含换行/空白的 run/work/owner 引用）与 `--clear` 仅清 `wait_on`（自动派发改由 `--no-auto` 显式清除，同次调用替换前置直落 `blocked`）。
 - `repo-governance`：`audit-context.py` 新增 `--fail-on none` 仅打印 `WARN` 不返回非零退出码；`scripts/check.sh` 与 `scripts/verify.sh` 默认将 token 预算检查改为提醒不阻断，保留 `--strict` 与 `AIA_SKILLS_STRICT_BUDGET=1` 供手动严格校验。
 
 ## delegate 6.63.0 - 2026-11-28

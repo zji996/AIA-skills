@@ -156,7 +156,7 @@ class DelegateEtaChain4Tests(unittest.TestCase):
         self.seed_events(repo, count=12, write_work_sec=900, cls="build")
 
         # Add an open work item to verify work DAG & per-work-item ETA in snapshot --json.
-        add = self.cli("work", "add", "implement eta tui", "--repo", str(repo), "--class", "feat", cwd=repo)
+        add = self.cli("work", "add", "implement eta tui", "--repo", str(repo), "--class", "feat", "--brief", "docs/eta.md", cwd=repo)
         self.assertEqual(add.returncode, 0, add.stdout + add.stderr)
 
         state_doc, gate = self.start_gated(

@@ -72,6 +72,7 @@ fn kind_label(kind: &str) -> &str {
         "work_dispatched" => "工作项自动派发",
         "work_defer_expired" => "暂缓到期",
         "work_stale" => "工作项停滞",
+        "owner_drop" => "交接投递",
         other => other,
     }
 }
@@ -2669,6 +2670,27 @@ enum TemplateKind {
         name: String,
         run: String,
     },
+    OwnerDrop {
+        repo_prefix: String,
+        primary_path: String,
+        count: usize,
+        size_text: String,
+        time_text: String,
+        matched_qid: Option<String>,
+        matched_title: Option<String>,
+        sole_open_act_id: Option<String>,
+    },
+}
+
+fn quote_path_if_needed(p: &str) -> String {
+    if !p.is_empty()
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.'))
+    {
+        p.to_string()
+    } else {
+        shell_quote(p)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2741,7 +2763,9 @@ impl PendingItem {
                 format!("`{start_cmd}`")
             }
             TemplateKind::WorkMissingBrief { wid, .. } => {
-                format!("`delegate work wait {wid} --brief <文件>`")
+                format!(
+                    "`delegate work wait {wid} --brief <文件>`（无需派活则 `delegate work close {wid} --evidence \"…\"`）"
+                )
             }
             TemplateKind::WorkVerify { wid, .. } => {
                 format!("`delegate work close {wid} --evidence \"…\"`")
@@ -2751,6 +2775,32 @@ impl PendingItem {
             }
             TemplateKind::Adopt { run, .. } => {
                 format!("`delegate adopt {run}`")
+            }
+            TemplateKind::OwnerDrop {
+                primary_path,
+                count,
+                matched_qid,
+                ..
+            } => {
+                let ack_arg = if *count > 1 {
+                    "--all".to_string()
+                } else {
+                    quote_path_if_needed(primary_path)
+                };
+                let repo_flag = if !self.is_current {
+                    self.repo_root
+                        .as_deref()
+                        .map(|r| format!(" --repo {}", shell_quote(&r.to_string_lossy())))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let ack_cmd = format!("delegate work ack-drop {ack_arg}{repo_flag}");
+                if let Some(qid) = matched_qid {
+                    format!("核实后 `delegate work close {qid} --evidence \"…\"`；若无关则 `{ack_cmd}`")
+                } else {
+                    format!("处理后 `{ack_cmd}`")
+                }
             }
         }
     }
@@ -2834,6 +2884,34 @@ impl PendingItem {
             }
             TemplateKind::Adopt { name, .. } => {
                 format!("{name} 属同终端/同工作目录已失效会话。下一步：{next}{more}")
+            }
+            TemplateKind::OwnerDrop {
+                repo_prefix,
+                primary_path,
+                count,
+                size_text,
+                time_text,
+                matched_qid,
+                matched_title,
+                sole_open_act_id,
+            } => {
+                let path_disp = if *count > 1 {
+                    format!("{primary_path} 等 {count} 个文件")
+                } else {
+                    primary_path.clone()
+                };
+                let detail = if let Some(qid) = matched_qid {
+                    let t = matched_title
+                        .as_deref()
+                        .map(|s| format!(" {}", clip_title(s, TITLE_MAX_CHARS)))
+                        .unwrap_or_default();
+                    format!("{size_text}，{time_text}，可能对应 [{qid}]{t}")
+                } else if let Some(sid) = sole_open_act_id {
+                    format!("{size_text}，{time_text}，本仓待动手项：{sid}")
+                } else {
+                    format!("{size_text}，{time_text}")
+                };
+                format!("{repo_prefix}交接目录新文件 {path_disp}（{detail}）。下一步：{next}{more}")
             }
         }
     }
@@ -3913,6 +3991,142 @@ fn evaluate_core(
 
 
     // ------------------------------------------------------------------
+    // 5b. Owner drop directory pending files (zero-lock, metadata-only lstat)
+    //     - Tier 2 when any matched Q/D item blocks >= 1 downstream work item
+    //     - Tier 3 otherwise (grouped per repository, 1 summary item per repo)
+    // ------------------------------------------------------------------
+    {
+        let cursor_entry = if !caller_id.is_empty() && cursors_doc["callers"][&caller_id].is_object() {
+            &cursors_doc["callers"][&caller_id]
+        } else if cursors_doc["default"].is_object() {
+            &cursors_doc["default"]
+        } else {
+            &Value::Null
+        };
+        let cursor_seq = cursor_entry["seq"].as_u64().unwrap_or(0);
+        let drop_snap = crate::owner_drop::inspect_readonly(state, &work_items, current_repo.as_deref());
+        let mut by_repo: BTreeMap<String, Vec<crate::owner_drop::PendingDrop>> = BTreeMap::new();
+        for d in drop_snap.pending {
+            if !allow_cross_session {
+                continue;
+            }
+            if d.seen_seq > 0 && d.seen_seq <= cursor_seq {
+                continue;
+            }
+            let drop_repo_norm = norm_path_str(&d.repo);
+            let drop_is_current = !current_repo_str.is_empty() && drop_repo_norm == current_repo_str;
+            if !drop_is_current && current_only {
+                continue;
+            }
+            by_repo.entry(d.repo.clone()).or_default().push(d);
+        }
+
+        for (repo_key, mut drops) in by_repo {
+            if drops.is_empty() {
+                continue;
+            }
+            let drop_repo_norm = norm_path_str(&repo_key);
+            let drop_is_current =
+                !current_repo_str.is_empty() && drop_repo_norm == current_repo_str;
+            let repo_label = drops[0].repo_label.clone();
+            let repo_prefix = if drop_is_current || repo_label.is_empty() {
+                String::new()
+            } else {
+                format!("【{repo_label}】")
+            };
+
+            let mut all_blocked_set: HashSet<String> = HashSet::new();
+            let mut drop_blocks: HashMap<String, Vec<String>> = HashMap::new();
+            for d in &drops {
+                let mut blk = Vec::new();
+                for qid in &d.matched_ids {
+                    for down in work::blocked_downstream_in(&work_items, &[], std::slice::from_ref(qid)) {
+                        all_blocked_set.insert(down.clone());
+                        if !blk.contains(&down) {
+                            blk.push(down);
+                        }
+                    }
+                }
+                drop_blocks.insert(d.rel_path.clone(), blk);
+            }
+            let mut blocked_downstream: Vec<String> = all_blocked_set.into_iter().collect();
+            blocked_downstream.sort();
+
+            drops.sort_by(|a, b| {
+                let a_blk = drop_blocks.get(&a.rel_path).map_or(0, Vec::len);
+                let b_blk = drop_blocks.get(&b.rel_path).map_or(0, Vec::len);
+                b_blk
+                    .cmp(&a_blk)
+                    .then_with(|| (!b.matched_ids.is_empty()).cmp(&(!a.matched_ids.is_empty())))
+                    .then_with(|| b.mtime_ns.cmp(&a.mtime_ns))
+                    .then_with(|| a.rel_path.cmp(&b.rel_path))
+            });
+
+            let count = drops.len();
+            let primary = &drops[0];
+            let matched_qid = primary.matched_ids.first().cloned();
+            let matched_title = matched_qid
+                .as_deref()
+                .and_then(|qid| work_by_id.get(qid))
+                .map(|w| w.title.replace(['\n', '\r'], " ").trim().to_string());
+            let size_text = crate::owner_drop::format_size_human(primary.size);
+            let time_text = primary.local_time_short();
+            let wait_secs = (now - primary.mtime_sec()).max(0);
+            let wait_mins = (wait_secs / 60) as u64;
+            let is_blocking = !blocked_downstream.is_empty();
+            let (priority_tier, category, category_label, stall_score) = if is_blocking {
+                (
+                    2,
+                    "stall_owner_drop",
+                    "卡链交接",
+                    (blocked_downstream.len() as u64).saturating_mul(wait_mins.max(1)),
+                )
+            } else {
+                (3, "owner_drop", "交接投递", 0)
+            };
+            let display_name = if count > 1 {
+                format!("{repo_prefix}{} 等 {count} 个文件", primary.rel_path)
+            } else {
+                format!("{repo_prefix}{}", primary.rel_path)
+            };
+            let status_text = if let Some(ref qid) = matched_qid {
+                format!("{size_text}，{time_text}，可能对应 [{qid}]")
+            } else if let Some(ref sid) = primary.sole_open_act_id {
+                format!("{size_text}，{time_text}，本仓待动手项：{sid}")
+            } else {
+                format!("{size_text}，{time_text}")
+            };
+
+            out_items.push(PendingItem {
+                priority_tier,
+                stall_score,
+                blocked_downstream,
+                wait_secs,
+                is_orphan: false,
+                hook_kind: "owner_drop",
+                category,
+                category_label,
+                target_id: primary.rel_path.clone(),
+                display_name,
+                repo_root: Some(PathBuf::from(&repo_key)),
+                is_current: drop_is_current,
+                status_text,
+                work_id_for_cooldown: None,
+                template: TemplateKind::OwnerDrop {
+                    repo_prefix,
+                    primary_path: primary.rel_path.clone(),
+                    count,
+                    size_text,
+                    time_text,
+                    matched_qid,
+                    matched_title,
+                    sole_open_act_id: primary.sole_open_act_id.clone(),
+                },
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 6. Deterministic priority ordering
     //    Tier 1: question
     //    Tier 2: stall-chain blocking items (highest stall_score first)
@@ -4791,7 +5005,7 @@ mod tests {
         });
         assert_eq!(
             t6.format_block_reason(0, HookFormat::Claude),
-            "[W059] 补测试说明 没有任务说明。下一步：`delegate work wait W059 --brief <文件>`"
+            "[W059] 补测试说明 没有任务说明。下一步：`delegate work wait W059 --brief <文件>`（无需派活则 `delegate work close W059 --evidence \"…\"`）"
         );
 
         let t7 = make(TemplateKind::WorkVerify {
@@ -4955,5 +5169,171 @@ mod tests {
             &[],
             &[],
         ));
+    }
+
+    #[test]
+    fn owner_drop_blocks_without_gc_worker_upgrades_to_tier2_and_clears_on_ack_or_cursor() {
+        let dir = std::env::temp_dir().join(format!(
+            "delegate-hook-owner-drop-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let state = dir.join("state");
+        let cache = dir.join("cache");
+        let repo = dir.join("demo-repo");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("tmp")).unwrap();
+        write_json(repo.join(".delegate.json"), &json!({"ownerDrop": ["tmp/"]})).unwrap();
+
+        let repo_canon = fs::canonicalize(&repo).unwrap();
+        let repo_str = repo_canon.to_string_lossy().into_owned();
+
+        // Write Q01 (deferred) and W001 (blocked on owner:Q01) to work.jsonl
+        let q1 = WorkItem {
+            id: "Q01".into(),
+            title: "建 Acme OAuth App".into(),
+            repo: repo_str.clone(),
+            state: "deferred".into(),
+            defer_until: "2099-01-01T00:00:00Z".into(),
+            owner: Some(work::OwnerInfo {
+                kind: "act".into(),
+                ask: "请把 Acme OAuth 凭据放到交接目录".into(),
+                recommendation: "建议完成".into(),
+                if_undecided: "阻塞".into(),
+                cost: "5m".into(),
+                ..Default::default()
+            }),
+            created_at: "2026-11-28T00:00:00Z".into(),
+            updated_at: "2026-11-28T00:00:00Z".into(),
+            state_since: "2026-11-28T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let w1 = WorkItem {
+            id: "W001".into(),
+            title: "接入 Acme OAuth".into(),
+            repo: repo_str.clone(),
+            state: "blocked".into(),
+            wait_on: vec!["owner:Q01".into()],
+            created_at: "2026-11-28T00:00:00Z".into(),
+            updated_at: "2026-11-28T00:00:00Z".into(),
+            state_since: "2026-11-28T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let work_lines = format!("{}\n{}\n", q1.to_json(), w1.to_json());
+        fs::write(state.join("work.jsonl"), work_lines).unwrap();
+
+        // Initialize silent baseline (as happens on first write command)
+        let mut items = vec![q1.clone(), w1.clone()];
+        let _ = crate::owner_drop::sync_locked(&state, &mut items, Some(&repo_canon));
+
+        let now = epoch() as i64;
+        let known_caller = "known-controller-session";
+        let nongit_caller = "known-nongit-session";
+        let non_git_dir = dir.join("non-git-cwd");
+        fs::create_dir_all(&non_git_dir).unwrap();
+        let non_git_str = non_git_dir.to_string_lossy().into_owned();
+        write_json(
+            state.join("sessions.json"),
+            &json!({
+                known_caller: {
+                    "lastSeenAt": format_epoch(now, false, "%Y-%m-%dT%H:%M:%SZ"),
+                    "repos": [repo_str],
+                },
+                nongit_caller: {
+                    "lastSeenAt": format_epoch(now, false, "%Y-%m-%dT%H:%M:%SZ"),
+                    "cwd": non_git_str,
+                }
+            }),
+        )
+        .unwrap();
+        let payload = json!({"cwd": repo_str, "session_id": known_caller});
+
+        // No new files yet -> hook_check produces 0 items
+        let out0 = evaluate_core(&state, &cache, &payload, &repo_str, now, EvalMode::Check);
+        assert!(out0.items.is_empty());
+
+        // Drop a 0 B empty file matching Q01 WITHOUT running _gc-worker!
+        fs::create_dir_all(repo_canon.join("tmp/secret")).unwrap();
+        fs::write(repo_canon.join("tmp/secret/acme-oauth"), "").unwrap();
+
+        let out1 = evaluate_core(&state, &cache, &payload, &repo_str, now, EvalMode::Check);
+        assert_eq!(out1.items.len(), 1);
+        let top = &out1.items[0];
+        assert_eq!(top.priority_tier, 2, "blocking Q01 drop must upgrade to Tier 2");
+        assert_eq!(top.blocked_downstream, vec!["W001"]);
+        let msg = top.format_block_reason(0, HookFormat::Claude);
+        assert!(msg.contains("tmp/secret/acme-oauth"), "got: {msg}");
+        assert!(msg.contains("0 B 空文件"), "got: {msg}");
+        assert!(msg.contains("可能对应 [Q01]"), "got: {msg}");
+        assert!(msg.contains("delegate work close Q01"), "got: {msg}");
+        assert!(msg.contains("delegate work ack-drop tmp/secret/acme-oauth"), "got: {msg}");
+
+        // Persist event so `seenSeq > 0`, then verify `events --since` cursor clears it for caller
+        let sync_res = crate::owner_drop::sync_locked(&state, &mut items, Some(&repo_canon));
+        assert_eq!(sync_res.new_events, 1);
+        let seen_state = crate::owner_drop::SeenState::load(&state);
+        let seen_seq = seen_state.repos[&repo_str].files["tmp/secret/acme-oauth"].seen_seq;
+        assert!(seen_seq > 0);
+        write_json(
+            state.join("cursors.json"),
+            &json!({"callers": {known_caller: {"seq": seen_seq}}}),
+        )
+        .unwrap();
+        let out_read = evaluate_core(&state, &cache, &payload, &repo_str, now, EvalMode::Check);
+        assert!(
+            out_read.items.is_empty(),
+            "cursor past seenSeq must treat drop as read"
+        );
+
+        // Reset cursor, then verify stranger session (never used delegate in this repo) is NOT blocked!
+        write_json(
+            state.join("cursors.json"),
+            &json!({"callers": {known_caller: {"seq": 0}}}),
+        )
+        .unwrap();
+        let stranger_payload = json!({
+            "cwd": repo_str,
+            "session_id": "stranger-session-never-used-delegate",
+        });
+        let out_stranger =
+            evaluate_core(&state, &cache, &stranger_payload, &repo_str, now, EvalMode::Check);
+        assert!(
+            out_stranger.items.is_empty(),
+            "stranger session must not be blocked by OwnerDrop, got: {:?}",
+            out_stranger.items
+        );
+
+        // Verify running from a non-git directory marks `is_current = false`, adds `【repo】` prefix,
+        // and appends `--repo <dir>` to `ack-drop` so the command is executable (both Check & Pending).
+        let non_git_payload = json!({"cwd": non_git_str, "session_id": nongit_caller});
+        for mode in [EvalMode::Check, EvalMode::Pending] {
+            let out_nongit =
+                evaluate_core(&state, &cache, &non_git_payload, &non_git_str, now, mode);
+            assert_eq!(out_nongit.items.len(), 1);
+            let ng_top = &out_nongit.items[0];
+            assert!(
+                !ng_top.is_current,
+                "non-git cwd must not treat repo drop as current"
+            );
+            let ng_msg = ng_top.format_block_reason(0, HookFormat::Claude);
+            assert!(
+                ng_msg.contains("【demo-repo】"),
+                "missing repo prefix: {ng_msg}"
+            );
+            assert!(
+                ng_msg.contains("--repo "),
+                "non-git cwd ack-drop command must include --repo: {ng_msg}"
+            );
+        }
+
+        // Ack via work close Q01 helper -> clears completely
+        let acked = crate::owner_drop::ack_matched_for_work_locked(&state, &q1);
+        assert_eq!(acked, 1);
+        let out_acked = evaluate_core(&state, &cache, &payload, &repo_str, now, EvalMode::Check);
+        assert!(out_acked.items.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

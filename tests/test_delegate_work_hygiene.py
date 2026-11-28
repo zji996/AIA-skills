@@ -199,7 +199,7 @@ class DelegateWorkHygieneTests(unittest.TestCase):
         self.assertIsNotNone(blk2)
         self.assertEqual(
             blk2["reason"],
-            "[W006] 缺说明就绪项 没有任务说明。下一步：`delegate work wait W006 --brief <文件>`",
+            '[W006] 缺说明就绪项 没有任务说明。下一步：`delegate work wait W006 --brief <文件>`（无需派活则 `delegate work close W006 --evidence "…"`）',
         )
 
         # Next run immediately: all 4 eligible items are within 6h cooldown -> passes!

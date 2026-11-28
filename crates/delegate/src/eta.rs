@@ -2542,7 +2542,8 @@ pub fn estimate_work_dag_in(
         }
 
         let eta_cls = work_class_to_eta_class(&w.class);
-        if w.state == "verify" || w.applied {
+        let is_unbriefed_unrun = w.is_unbriefed_unrun();
+        if w.state == "verify" || w.applied || is_unbriefed_unrun {
             node_dev_del.insert(w.id.clone(), (0.0, 0.0, false));
             node_dev_app.insert(w.id.clone(), (0.0, 0.0, false));
         } else if let Some(re) = live_eta {
@@ -2822,7 +2823,16 @@ pub fn estimate_work_dag_in(
 
         // 1. Owner blocker? (Strict separation per design.md底线 2)
         if let Some(oref) = owner_blocker_ref.get(&w.id) {
-            let range_str = format_duration_range(tot50, tot75);
+            let (after_p50, after_p75, label) = if tot50 > 0.0 || tot75 > 0.0 {
+                let range_str = format_duration_range(tot50, tot75);
+                (
+                    Some(tot50),
+                    Some(tot75),
+                    format!("卡在所有者 [{oref}]·解锁后约 {range_str}"),
+                )
+            } else {
+                (None, None, format!("卡在所有者 [{oref}]"))
+            };
             let b = BlockerInfo {
                 kind: BlockerKind::Owner,
                 who: "所有者".into(),
@@ -2831,9 +2841,9 @@ pub fn estimate_work_dag_in(
                 target: Some(oref.clone()),
                 affected_count: None,
                 unlock_at: None,
-                after_unlock_p50_sec: Some(tot50),
-                after_unlock_p75_sec: Some(tot75),
-                label: format!("卡在所有者 [{oref}]·解锁后约 {range_str}"),
+                after_unlock_p50_sec: after_p50,
+                after_unlock_p75_sec: after_p75,
+                label,
             };
             owner_blocked.push(BlockerItem {
                 id: w.id.clone(),
@@ -2941,7 +2951,14 @@ pub fn estimate_work_dag_in(
             }
         }
 
-        let remaining = if owner_blocker_ref.contains_key(&w.id) {
+        let is_unbriefed_unrun = w.is_unbriefed_unrun();
+        let remaining = if owner_blocker_ref.contains_key(&w.id)
+            || (is_unbriefed_unrun
+                && a50 == 0.0
+                && a75 == 0.0
+                && !node_up_run.contains_key(&w.id)
+                && pw.is_none_or(|p| p.work_deps.is_empty()))
+        {
             None
         } else {
             let f50 = ef_p50.get(&w.id).copied().unwrap_or(now_ts);
@@ -2993,13 +3010,17 @@ pub fn estimate_work_dag_in(
                     format!("等{dep}(~{c50})"),
                 )
             } else if w.state == "ready" && run_eta.is_none() {
-                let dur = format_duration_range(a50, a75);
-                let c50 = format_clock(rem.rounded_p50_at, now_ts);
-                let c75 = format_clock(rem.rounded_p75_at, now_ts);
-                (
-                    format!("预计耗时 {dur}（现派约 {c50} 合入，p75 {c75}）{verify_note}"),
-                    format!("预计耗时 {dur}"),
-                )
+                if is_unbriefed_unrun {
+                    ("-".into(), "-".into())
+                } else {
+                    let dur = format_duration_range(a50, a75);
+                    let c50 = format_clock(rem.rounded_p50_at, now_ts);
+                    let c75 = format_clock(rem.rounded_p75_at, now_ts);
+                    (
+                        format!("预计耗时 {dur}（现派约 {c50} 合入，p75 {c75}）{verify_note}"),
+                        format!("预计耗时 {dur}"),
+                    )
+                }
             } else {
                 let c50 = format_clock(rem.rounded_p50_at, now_ts);
                 let c75 = format_clock(rem.rounded_p75_at, now_ts);
@@ -4777,6 +4798,7 @@ mod tests {
                 repo: repo.into(),
                 state: "ready".into(),
                 class: "feat".into(),
+                brief: "docs/w001.md".into(),
                 ..Default::default()
             },
             WorkItem {
@@ -4785,6 +4807,7 @@ mod tests {
                 repo: repo.into(),
                 state: "blocked".into(),
                 class: "feat".into(),
+                brief: "docs/w002.md".into(),
                 wait_on: vec!["work_applied:W001".into(), format!("after_time:{after_iso}")],
                 ..Default::default()
             },
@@ -4805,6 +4828,7 @@ mod tests {
                 repo: repo.into(),
                 state: "blocked".into(),
                 class: "feat".into(),
+                brief: "docs/w003.md".into(),
                 wait_on: vec!["owner:Q01".into()],
                 ..Default::default()
             },
@@ -4814,6 +4838,7 @@ mod tests {
                 repo: repo.into(),
                 state: "blocked".into(),
                 class: "feat".into(),
+                brief: "docs/w004.md".into(),
                 wait_on: vec!["work_applied:W003".into()],
                 ..Default::default()
             },
@@ -5165,6 +5190,7 @@ mod tests {
             title: "链2".into(),
             state: "blocked".into(),
             class: "feat".into(),
+            brief: "docs/w015.md".into(),
             wait_on: vec!["work_applied:W012".into()],
             ..Default::default()
         };
@@ -5214,6 +5240,7 @@ mod tests {
                 repo: repo.into(),
                 state: "ready".into(),
                 class: "feat".into(),
+                brief: "docs/w119.md".into(),
                 ..Default::default()
             },
             WorkItem {
@@ -5222,6 +5249,7 @@ mod tests {
                 repo: repo.into(),
                 state: "blocked".into(),
                 class: "feat".into(),
+                brief: "docs/w120.md".into(),
                 wait_on: vec!["work_closed:W119".into()],
                 ..Default::default()
             },
@@ -5231,6 +5259,7 @@ mod tests {
                 repo: repo.into(),
                 state: "deferred".into(),
                 class: "feat".into(),
+                brief: "docs/w006.md".into(),
                 defer_until: format_epoch(now + 5 * 86_400, false, "%Y-%m-%dT%H:%M:%SZ"),
                 ..Default::default()
             },
@@ -5240,6 +5269,7 @@ mod tests {
                 repo: repo.into(),
                 state: "deferred".into(),
                 class: "feat".into(),
+                brief: "docs/w064.md".into(),
                 defer_until: format_epoch(now + 6 * 3600, false, "%Y-%m-%dT%H:%M:%SZ"),
                 ..Default::default()
             },
@@ -5289,6 +5319,7 @@ mod tests {
                 repo: repo.into(),
                 state: "ready".into(),
                 class: "feat".into(),
+                brief: "docs/w119.md".into(),
                 ..Default::default()
             },
             WorkItem {
@@ -5297,6 +5328,7 @@ mod tests {
                 repo: repo.into(),
                 state: "blocked".into(),
                 class: "feat".into(),
+                brief: "docs/w120.md".into(),
                 wait_on: vec!["work_closed:W119".into()],
                 ..Default::default()
             },
@@ -5306,6 +5338,7 @@ mod tests {
                 repo: repo.into(),
                 state: "deferred".into(),
                 class: "feat".into(),
+                brief: "docs/w006.md".into(),
                 defer_until: format_epoch(now + 5 * 86_400, false, "%Y-%m-%dT%H:%M:%SZ"),
                 ..Default::default()
             },
@@ -5317,6 +5350,7 @@ mod tests {
                 repo: repo.into(),
                 state: "ready".into(),
                 class: "feat".into(),
+                brief: format!("docs/w20{i}.md"),
                 ..Default::default()
             });
         }

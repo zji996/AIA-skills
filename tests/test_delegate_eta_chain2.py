@@ -369,7 +369,7 @@ class DelegateEtaChain2Tests(unittest.TestCase):
         now = self.seed_events(repo, count=12, base_dur=900, cls="build")
 
         def work_add(*args) -> str:
-            r = self.cli("work", "add", "--json", *args, cwd=repo)
+            r = self.cli("work", "add", "--brief", "docs/task.md", "--json", *args, cwd=repo)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             d = json.loads(r.stdout)
             return d.get("id") or d["item"]["id"]

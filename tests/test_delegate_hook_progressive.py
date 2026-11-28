@@ -344,7 +344,7 @@ class DelegateHookProgressiveTests(unittest.TestCase):
             '[未合入] feat-unmerged · 已交付未合入（预合并失败：generate） · 下一步：`delegate card 20261124-100003-feat-unmerged`；合不了用 `delegate work defer 20261124-100003-feat-unmerged --until 4h --reason "…"`',
             f"[就绪未派] [W010] 就绪十小时项 · 就绪 10 小时没派 · 下一步：`delegate start --work W010 --prompt-file {brief}`",
             '[待闭环] [W012] 待闭环五小时项 · 待闭环 5 小时 · 下一步：`delegate work close W012 --evidence "…"`',
-            "[缺说明] [W011] 缺说明两小时项 · 没有任务说明 · 下一步：`delegate work wait W011 --brief <文件>`",
+            '[缺说明] [W011] 缺说明两小时项 · 没有任务说明 · 下一步：`delegate work wait W011 --brief <文件>`（无需派活则 `delegate work close W011 --evidence "…"`）',
         ]
         self.assertEqual(res.stdout.strip().splitlines(), expected_lines)
         # Strictly read-only: must not touch work-remind.json or stop-hook.jsonl.
@@ -508,7 +508,7 @@ class DelegateHookProgressiveTests(unittest.TestCase):
             b6,
             {
                 "decision": "block",
-                "reason": "[W021] 补任务说明 没有任务说明。下一步：`delegate work wait W021 --brief <文件>`",
+                "reason": '[W021] 补任务说明 没有任务说明。下一步：`delegate work wait W021 --brief <文件>`（无需派活则 `delegate work close W021 --evidence "…"`）',
             },
         )
 
@@ -601,7 +601,7 @@ class DelegateHookProgressiveTests(unittest.TestCase):
         self.assertIsNotNone(blk)
         self.assertEqual(
             blk["reason"],
-            "[W059] 超过一小时的缺说明项 没有任务说明。下一步：`delegate work wait W059 --brief <文件>`",
+            '[W059] 超过一小时的缺说明项 没有任务说明。下一步：`delegate work wait W059 --brief <文件>`（无需派活则 `delegate work close W059 --evidence "…"`）',
         )
 
     # ------------------------------------------------------------------

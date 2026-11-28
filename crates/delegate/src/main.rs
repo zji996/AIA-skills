@@ -41,6 +41,7 @@ mod merge;
 mod models;
 mod notes;
 mod output;
+mod owner_drop;
 mod pool;
 mod premerge;
 mod probe;
@@ -3908,6 +3909,8 @@ fn main_inner(args: &[String]) -> Res<i32> {
 
             let arch_usage = archive::usage();
             let disk_health = disk::inspect_readonly(&state_root, &cache_dir(), now_ts);
+            let owner_drop_diags =
+                owner_drop::diagnostics_readonly(&state_root, Some(&cur_repo_canon));
             let concurrency_plan = lane::local_plan(None).ok();
             let concurrency_pool = concurrency_plan
                 .as_ref()
@@ -3961,11 +3964,20 @@ fn main_inner(args: &[String]) -> Res<i32> {
                         None => plan.to_json(),
                     };
                 }
+                if !owner_drop_diags.is_empty() {
+                    summary["ownerDropWarnings"] = json!(owner_drop_diags
+                        .iter()
+                        .map(|d| d.to_json())
+                        .collect::<Vec<_>>());
+                }
                 println!("{}", json!({"statusSummary": summary}));
             } else {
                 let warn_line = pulse::format_status_quota_alert_line_in(&state_root, now_ts);
                 if let Some(ref line) = warn_line {
                     println!("{line}");
+                }
+                if let Some(diag) = owner_drop_diags.first() {
+                    println!("{}", diag.format_warning_line());
                 }
                 let mut counts = format!(
                     "运行中 {running} · 待合入 {pending_apply} · 待回答 {pending_question} · 排队 {queued}"

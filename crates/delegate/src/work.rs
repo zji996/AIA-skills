@@ -91,6 +91,8 @@ pub struct OwnerInfo {
     pub recommendation: String,
     pub if_undecided: String,
     pub cost: String,
+    pub drop_path: String,
+    pub last_drop_hint: String,
 }
 
 impl OwnerInfo {
@@ -128,6 +130,8 @@ impl OwnerInfo {
             recommendation: s(v, "recommendation").to_string(),
             if_undecided: s(v, "ifUndecided").to_string(),
             cost: s(v, "cost").to_string(),
+            drop_path: s(v, "dropPath").to_string(),
+            last_drop_hint: s(v, "lastDropHint").to_string(),
         })
     }
 
@@ -144,6 +148,12 @@ impl OwnerInfo {
         }
         if !self.cost.is_empty() {
             obj["cost"] = json!(self.cost);
+        }
+        if !self.drop_path.is_empty() {
+            obj["dropPath"] = json!(self.drop_path);
+        }
+        if !self.last_drop_hint.is_empty() {
+            obj["lastDropHint"] = json!(self.last_drop_hint);
         }
         obj
     }
@@ -391,6 +401,33 @@ impl WorkItem {
             || !self.verify_on.is_empty()
             || !self.artifacts.is_empty()
             || self.pending_followups() > 0
+    }
+
+    pub fn has_human_verify(&self) -> bool {
+        self.verify_on.iter().any(|c| c.starts_with("human:"))
+    }
+
+    pub fn first_human_verify(&self) -> Option<&str> {
+        self.verify_on
+            .iter()
+            .find_map(|c| c.strip_prefix("human:").map(str::trim).filter(|t| !t.is_empty()))
+    }
+
+    /// True when an un-run non-owner work item without brief/auto_dispatch carries `human:`
+    /// verification or `needs_verify`, so it should enter and stay in `verify` once unblocked.
+    pub fn enters_verify_without_runs(&self) -> bool {
+        self.owner.is_none()
+            && self.brief.trim().is_empty()
+            && self.auto_dispatch.is_none()
+            && (self.has_human_verify() || self.needs_verify)
+    }
+
+    /// True when a non-owner work item has no brief, no auto_dispatch, and no runs yet.
+    pub fn is_unbriefed_unrun(&self) -> bool {
+        self.owner.is_none()
+            && self.brief.trim().is_empty()
+            && self.auto_dispatch.is_none()
+            && self.runs.is_empty()
     }
 
     /// True when an open non-direction owner item lacks any of the four required fields
@@ -708,6 +745,9 @@ fn parse_work_num(id: &str) -> Option<u64> {
 }
 
 pub fn normalize_work_id(raw: &str) -> Option<String> {
+    if raw.contains(['\n', '\r', '\0']) {
+        return None;
+    }
     let t = raw.trim();
     if let Some(n) = parse_prefixed_num(t, 'W', 'w') {
         return Some(format!("W{n:03}"));
@@ -719,6 +759,57 @@ pub fn normalize_work_id(raw: &str) -> Option<String> {
         return Some(format!("D{n:03}"));
     }
     None
+}
+
+fn validate_run_ref(raw: &str, flag: &str) -> Res<String> {
+    if raw.contains(['\n', '\r', '\0']) {
+        return Err(format!(
+            "invalid run id in {flag}: {:?} (must be a single-line run id without newlines)",
+            raw
+        ));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(format!(
+            "invalid run id in {flag}: '{trimmed}' (expected run id with ASCII letters/digits/._-)"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_owner_ref(raw: &str, flag: &str) -> Res<String> {
+    if raw.contains(['\n', '\r', '\0']) {
+        return Err(format!(
+            "invalid owner ref in {flag}: {:?} (must not contain newlines)",
+            raw
+        ));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{flag} requires a non-empty ref (e.g. Q18, D002)"));
+    }
+    if let Some(norm) = normalize_work_id(trimmed) {
+        if !is_owner_id(&norm) {
+            return Err(format!(
+                "invalid owner ref in {flag}: '{trimmed}' (expected Qxx/Dxxx, not work id '{norm}')"
+            ));
+        }
+        return Ok(norm);
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        || !trimmed.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return Err(format!(
+            "invalid owner ref in {flag}: '{trimmed}' (expected Qxx, Dxxx, or ASCII owner ref)"
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 fn is_owner_id(id: &str) -> bool {
@@ -2218,6 +2309,15 @@ fn evaluate_condition_with_prefetch(
             pointer: readme.to_string_lossy().into_owned(),
         };
     }
+    if let Some(text) = cond.strip_prefix("human:") {
+        let t = text.trim();
+        return CondEval {
+            raw: cond.to_string(),
+            satisfied: false,
+            detail: format!("待人工确认：{t}"),
+            pointer: format!("delegate work close {} --evidence \"…\"", item.id),
+        };
+    }
     if let Some(sha_raw) = cond.strip_prefix("commit_exists:") {
         let sha = sha_raw.trim();
         let repo_str = if item.repo.is_empty() {
@@ -2750,6 +2850,11 @@ fn reconcile_all_locked_full(
                         } else {
                             out.to_auto_dispatch.push(item.clone());
                         }
+                    } else if item.enters_verify_without_runs() {
+                        if item.set_state("verify", &now_iso) {
+                            out.changed = true;
+                        }
+                        out.unlocked_ready.push(item.clone());
                     } else {
                         if item.set_state("ready", &now_iso) {
                             out.changed = true;
@@ -2776,6 +2881,7 @@ fn reconcile_all_locked_full(
             }
             if matches!(item.state.as_str(), "deferred" | "active" | "attention") {
                 let next_st = if live_zero_change_delivered
+                    || item.enters_verify_without_runs()
                     || (item.has_open_closure()
                         && (item.applied || item.cleaned || !item.runs.is_empty()))
                 {
@@ -2786,6 +2892,11 @@ fn reconcile_all_locked_full(
                 if item.set_state(next_st, &now_iso) {
                     out.changed = true;
                 }
+            } else if item.state == "ready"
+                && item.enters_verify_without_runs()
+                && item.set_state("verify", &now_iso)
+            {
+                out.changed = true;
             }
 
             // 4b. Auto-close `verify` items when all `verify_on` conditions are satisfied
@@ -3286,12 +3397,17 @@ pub fn load_readonly_json(state: &Path) -> Vec<Value> {
         .collect()
 }
 
+pub fn load_raw_readonly(state: &Path) -> Vec<WorkItem> {
+    load_raw(state)
+}
+
 pub fn load_readonly_in(state: &Path) -> Vec<WorkItem> {
     let mut items = load_raw(state);
     if needs_legacy_migration(state) {
         let _ = migrate_legacy_impl(state, &mut items, false);
     }
     let _ = reconcile_all_locked_full(state, &mut items, None, None, false);
+    let _ = crate::owner_drop::apply_readonly_overlay(state, &mut items, None);
     items
 }
 
@@ -3302,7 +3418,9 @@ fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
     let mut snapshot = load_raw(state);
     let prefetch = prefetch_reconcile_conditions(state, &snapshot, &[]);
     let preview = reconcile_all_locked_with_prefetch(state, &mut snapshot, None, Some(&prefetch));
-    if !needs_mig && !preview.changed && preview.to_fill_dispatch.is_empty() {
+    let drop_needs = crate::owner_drop::needs_sync_readonly(state, &snapshot, None);
+    if !needs_mig && !preview.changed && preview.to_fill_dispatch.is_empty() && !drop_needs {
+        let _ = crate::owner_drop::apply_readonly_overlay(state, &mut snapshot, None);
         return Ok(snapshot);
     }
 
@@ -3312,8 +3430,9 @@ fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
         let _guard = guard;
         let mut items = load_raw(state);
         let mig = migrate_legacy_locked(state, &mut items);
+        let drop_res = crate::owner_drop::sync_locked(state, &mut items, None);
         let outcome = reconcile_all_locked_with_prefetch(state, &mut items, None, Some(&prefetch));
-        if mig || outcome.changed {
+        if mig || drop_res.work_changed || outcome.changed {
             save_raw(state, &items)?;
         }
         (items, outcome)
@@ -3329,13 +3448,27 @@ fn load_synced_in(state: &Path) -> Res<Vec<WorkItem>> {
 /// never from read paths like `status` / `work` / `snapshot` / TUI).
 pub fn check_stale_and_expired() {
     let state = state_dir();
-    if !work_path(&state).is_file() {
+    let has_work = work_path(&state).is_file();
+    if !has_work {
+        if !crate::owner_drop::needs_sync_readonly(&state, &[], None) {
+            return;
+        }
+        let _ = fs::create_dir_all(&state);
+        let Ok(_guard) = crate::locks::try_acquire_state(&state) else {
+            return;
+        };
+        let mut items = load_raw(&state);
+        let drop_res = crate::owner_drop::sync_locked(&state, &mut items, None);
+        if drop_res.work_changed {
+            let _ = save_raw(&state, &items);
+        }
         return;
     }
     let mut snapshot = load_raw(&state);
     let prefetch = prefetch_reconcile_conditions(&state, &snapshot, &[]);
     let preview = reconcile_all_locked_with_prefetch(&state, &mut snapshot, None, Some(&prefetch));
-    if !preview.changed && preview.to_fill_dispatch.is_empty() {
+    let drop_needs = crate::owner_drop::needs_sync_readonly(&state, &snapshot, None);
+    if !preview.changed && preview.to_fill_dispatch.is_empty() && !drop_needs {
         return;
     }
     let Ok(_guard) = crate::locks::try_acquire_state(&state) else {
@@ -3344,9 +3477,10 @@ pub fn check_stale_and_expired() {
     let outcome = {
         let mut items = load_raw(&state);
         let mig = migrate_legacy_locked(&state, &mut items);
+        let drop_res = crate::owner_drop::sync_locked(&state, &mut items, None);
         let outcome =
             reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
-        if mig || outcome.changed {
+        if mig || drop_res.work_changed || outcome.changed {
             let _ = save_raw(&state, &items);
         }
         outcome
@@ -3736,6 +3870,12 @@ pub fn blocked_downstream_in(
                         && by_id.get(u.as_str()).is_none_or(|t| t.state != "done");
                 }
             }
+            if let Some(raw) = cond.strip_prefix("owner:") {
+                if let Some(u) = normalize_work_id(raw) {
+                    return owning_set.contains(&u)
+                        && by_id.get(u.as_str()).is_none_or(|t| t.state != "done");
+                }
+            }
             false
         });
         if directly_blocked && visited.insert(w.id.clone()) {
@@ -3826,8 +3966,21 @@ pub fn blocked_downstream_for_run(run_dir: &Path) -> Vec<String> {
 }
 
 pub fn ready_command_for(item: &WorkItem) -> String {
-    if !item.brief.is_empty() {
+    if item.state == "verify" {
+        return format!("delegate work close {} --evidence \"…\"", item.id);
+    }
+    if !item.brief.trim().is_empty() {
         format!("delegate start --work {} --prompt-file {}", item.id, item.brief)
+    } else if let Some(ad) = &item.auto_dispatch {
+        format!(
+            "delegate start --work {} --prompt-file {}",
+            item.id, ad.prompt_file
+        )
+    } else if item.is_unbriefed_unrun() {
+        format!(
+            "无任务说明：补 delegate work wait {} --brief <文件> 再派，或直接 delegate work close {} --evidence \"…\"",
+            item.id, item.id
+        )
     } else {
         format!(
             "delegate start --work {} {}",
@@ -5075,6 +5228,9 @@ fn focus_for_item_core(item: &WorkItem, all_items: &[WorkItem], state: &Path, no
             };
         }
         let kl = OwnerInfo::kind_label(&ow.kind);
+        if !ow.last_drop_hint.is_empty() {
+            return format!("{kl} · {}", clip_chars(&ow.last_drop_hint, 28));
+        }
         if !ow.recommendation.is_empty() {
             return format!("{kl} · 建议：{}", clip_chars(&ow.recommendation, 20));
         }
@@ -5151,16 +5307,27 @@ fn focus_for_item_core(item: &WorkItem, all_items: &[WorkItem], state: &Path, no
             "等前置".into()
         }
         "ready" => {
+            let missing_brief = item.is_unbriefed_unrun();
             if !item.wait_on.is_empty() {
                 if let Some(first) = item.wait_on.first() {
                     let ev = evaluate_condition(first, item, all_items, state, now_epoch);
                     if ev.satisfied {
-                        return ev.detail;
+                        return if missing_brief {
+                            format!("缺说明 · {}", ev.detail)
+                        } else {
+                            ev.detail
+                        };
                     }
                 }
             }
             let age = format_age(&item.state_since, now_epoch);
-            if age.is_empty() {
+            if missing_brief {
+                if age.is_empty() {
+                    "缺说明".into()
+                } else {
+                    format!("缺说明 {age}")
+                }
+            } else if age.is_empty() {
                 "就绪".into()
             } else {
                 format!("就绪 {age}")
@@ -5180,6 +5347,8 @@ fn focus_for_item_core(item: &WorkItem, all_items: &[WorkItem], state: &Path, no
                 if is_zero_change_delivered(&rdir, &meta, &sum) {
                     return if !item.done_when.is_empty() {
                         format!("已收取 · 待验({})", clip_chars(&item.done_when, 12))
+                    } else if let Some(human) = item.first_human_verify() {
+                        format!("已收取 · 待验({})", clip_chars(human, 12))
                     } else {
                         "已收取".into()
                     };
@@ -5188,6 +5357,8 @@ fn focus_for_item_core(item: &WorkItem, all_items: &[WorkItem], state: &Path, no
             let age = format_age(&item.state_since, now_epoch);
             if !item.done_when.is_empty() {
                 format!("待验({})", clip_chars(&item.done_when, 16))
+            } else if let Some(human) = item.first_human_verify() {
+                format!("待验({})", clip_chars(human, 16))
             } else {
                 format!("待闭环 {age}")
             }
@@ -5253,8 +5424,15 @@ fn next_action_for(item: &WorkItem, _all_items: &[WorkItem], state: &Path) -> St
             format!("work show {}", item.id)
         }
         "ready" => {
-            if !item.brief.is_empty() {
+            if !item.brief.trim().is_empty() {
                 format!("start --work {} --prompt-file {}", item.id, item.brief)
+            } else if let Some(ad) = &item.auto_dispatch {
+                format!("start --work {} --prompt-file {}", item.id, ad.prompt_file)
+            } else if item.runs.is_empty() {
+                format!(
+                    "work wait {} --brief <文件> 或 work close {} --evidence \"…\"",
+                    item.id, item.id
+                )
             } else {
                 format!("start --work {} \"…\"", item.id)
             }
@@ -5763,6 +5941,20 @@ fn render_card(item: &WorkItem, all_items: &[WorkItem], state: &Path, now_epoch:
     render_card_with_eta(item, all_items, state, now_epoch, None)
 }
 
+fn owner_drop_location_for(item: &WorkItem) -> Option<String> {
+    let ow = item.owner.as_ref()?;
+    if ow.kind != "act" {
+        return None;
+    }
+    if !ow.drop_path.trim().is_empty() {
+        return Some(ow.drop_path.trim().to_string());
+    }
+    if !item.repo.trim().is_empty() {
+        return crate::config::load_repo_owner_drop_first_display(Path::new(&item.repo));
+    }
+    None
+}
+
 fn render_card_with_eta(
     item: &WorkItem,
     all_items: &[WorkItem],
@@ -5788,23 +5980,27 @@ fn render_card_with_eta(
     if item.owner.is_none() && item.state != "done" {
         if let Some(dag) = dag_eta {
             if let Some(ie) = dag.items.iter().find(|x| x.id == item.id) {
-                let prefix = if ie.blocker.is_some() {
-                    "预估（停表）"
-                } else {
-                    "预估"
-                };
-                let own_note = if ie.upstream_path.len() <= 1
-                    && ie.blocker.is_none()
-                    && ie.dev_p50_sec > 0.0
-                {
-                    format!(
-                        "〔本项约 {}〕",
-                        crate::eta::format_duration_range(ie.dev_p50_sec, ie.dev_p75_sec)
-                    )
-                } else {
-                    String::new()
-                };
-                lines.push(format!("{prefix}：{}{own_note}", ie.short_text));
+                let skip_empty_eta =
+                    ie.short_text == "-" && ie.blocker.is_none() && ie.upstream_path.len() <= 1;
+                if !skip_empty_eta {
+                    let prefix = if ie.blocker.is_some() {
+                        "预估（停表）"
+                    } else {
+                        "预估"
+                    };
+                    let own_note = if ie.upstream_path.len() <= 1
+                        && ie.blocker.is_none()
+                        && ie.dev_p50_sec > 0.0
+                    {
+                        format!(
+                            "〔本项约 {}〕",
+                            crate::eta::format_duration_range(ie.dev_p50_sec, ie.dev_p75_sec)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    lines.push(format!("{prefix}：{}{own_note}", ie.short_text));
+                }
                 if ie.upstream_path.len() > 1 {
                     lines.push(format!("上游关键路径：{}", ie.upstream_path.join(" → ")));
                     let by_id: HashMap<&str, &crate::eta::WorkItemEta> =
@@ -5851,6 +6047,14 @@ fn render_card_with_eta(
         ));
         if !ow.ask.is_empty() {
             lines.push(format!("要你回答：{}", ow.ask));
+        }
+        if let Some(loc) = owner_drop_location_for(item) {
+            lines.push(format!(
+                "交付位置：本机材料可放 {loc}，主控会自动看到（跨机或网页操作请在对话说一声）"
+            ));
+        }
+        if !ow.last_drop_hint.is_empty() && item.state != "done" {
+            lines.push(format!("交接提示：{}", ow.last_drop_hint));
         }
         if !ow.recommendation.is_empty() {
             lines.push(format!("主控建议：{}", ow.recommendation));
@@ -6519,10 +6723,11 @@ pub fn command(args: &[String]) -> Res<i32> {
         "close" => close_cmd(rest),
         "drop" => drop_cmd(rest),
         "defer" => defer_cmd(rest),
+        "ack-drop" => ack_drop_cmd(rest),
         "import-md" => import_md_cmd(rest),
         "import-dag" => import_dag_cmd(rest),
         other => Err(format!(
-            "unknown work subcommand: '{other}' (expected: list, show, add, wait, close, drop, defer, import-md, import-dag)"
+            "unknown work subcommand: '{other}' (expected: list, show, add, wait, close, drop, defer, ack-drop, import-md, import-dag)"
         )),
     }
 }
@@ -6645,6 +6850,16 @@ fn list_cmd(args: &[String]) -> Res<i32> {
             .then_with(|| a.id.cmp(&b.id))
     });
 
+    let drop_snap = crate::owner_drop::inspect_readonly(&state, &items, None);
+    let filtered_drops: Vec<&crate::owner_drop::PendingDrop> = drop_snap
+        .pending
+        .iter()
+        .filter(|d| match repo_filter.as_deref() {
+            Some(rf) => d.repo_label == rf || d.repo == rf,
+            None => true,
+        })
+        .collect();
+
     if json_mode {
         for r in &visible {
             if r.is_ephemeral {
@@ -6689,6 +6904,12 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         if let Some(ref dag) = dag_eta {
             ws["eta"] = dag.to_json();
         }
+        if !filtered_drops.is_empty() {
+            ws["ownerDrops"] = json!(filtered_drops
+                .iter()
+                .map(|d| d.to_json())
+                .collect::<Vec<_>>());
+        }
         println!("{}", json!({"workSummary": ws}));
         return Ok(0);
     }
@@ -6704,6 +6925,36 @@ fn list_cmd(args: &[String]) -> Res<i32> {
         for r in &visible {
             println!("{}", format_table_row_with_width(r, term_w));
         }
+    }
+    if !filtered_drops.is_empty() {
+        let preview = filtered_drops
+            .iter()
+            .take(3)
+            .map(|d| {
+                let sz = crate::owner_drop::format_size_human(d.size);
+                if !d.matched_ids.is_empty() {
+                    format!(
+                        "[{}] {}（{}，可能对应 {}）",
+                        d.repo_label,
+                        d.rel_path,
+                        sz,
+                        d.matched_ids.join("/")
+                    )
+                } else {
+                    format!("[{}] {}（{}）", d.repo_label, d.rel_path, sz)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let extra_cnt = filtered_drops.len().saturating_sub(3);
+        let more = if extra_cnt > 0 {
+            format!(" 等共 {} 个", filtered_drops.len())
+        } else {
+            String::new()
+        };
+        println!(
+            "交接目录新投递：{preview}{more}（确认无关：delegate work ack-drop <路径|--all>）"
+        );
     }
     if !show_all && state_filter.is_none() {
         let b_cnt = counts.get("blocked").copied().unwrap_or(0);
@@ -7058,20 +7309,29 @@ fn render_owner_list(
                 println!("{obj}");
             }
         }
-        println!(
-            "{}",
-            json!({
-                "ownerSummary": {
-                    "open": open.len(),
-                    "act": n_act,
-                    "nod": n_nod,
-                    "card": n_card,
-                    "direction": n_dir,
-                    "dropped": dropped.len(),
-                    "closed": closed.len(),
-                }
+        let drop_snap = crate::owner_drop::inspect_readonly(state, items, None);
+        let filtered_drops: Vec<Value> = drop_snap
+            .pending
+            .iter()
+            .filter(|d| match repo_filter {
+                Some(rf) => d.repo_label == rf || d.repo == rf,
+                None => true,
             })
-        );
+            .map(|d| d.to_json())
+            .collect();
+        let mut summary = json!({
+            "open": open.len(),
+            "act": n_act,
+            "nod": n_nod,
+            "card": n_card,
+            "direction": n_dir,
+            "dropped": dropped.len(),
+            "closed": closed.len(),
+        });
+        if !filtered_drops.is_empty() {
+            summary["ownerDrops"] = json!(filtered_drops);
+        }
+        println!("{}", json!({ "ownerSummary": summary }));
         return Ok(0);
     }
 
@@ -7110,6 +7370,14 @@ fn render_owner_list(
                     ""
                 };
                 println!("[{}] [{}] {}{}", w.id, w.repo_label(), ask, missing_tag);
+                if let Some(loc) = owner_drop_location_for(w) {
+                    println!(
+                        "  交付位置：本机材料可放 {loc}，主控会自动看到（跨机或网页操作请在对话说一声）"
+                    );
+                }
+                if !ow.last_drop_hint.is_empty() {
+                    println!("  交接提示：{}", ow.last_drop_hint);
+                }
                 if !ow.recommendation.is_empty() {
                     println!("  建议：{}", ow.recommendation);
                 }
@@ -7124,6 +7392,31 @@ fn render_owner_list(
                 }
                 println!("  下一步：delegate {}", next_action_for(w, items, state));
             }
+        }
+    }
+
+    let drop_snap = crate::owner_drop::inspect_readonly(state, items, None);
+    let filtered_drops: Vec<&crate::owner_drop::PendingDrop> = drop_snap
+        .pending
+        .iter()
+        .filter(|d| match repo_filter {
+            Some(rf) => d.repo_label == rf || d.repo == rf,
+            None => true,
+        })
+        .collect();
+    if !filtered_drops.is_empty() {
+        println!("\n## 交接目录新投递 ({})", filtered_drops.len());
+        for d in &filtered_drops {
+            let sz = crate::owner_drop::format_size_human(d.size);
+            let t = d.local_time_short();
+            let match_note = if !d.matched_ids.is_empty() {
+                format!("，可能对应 {}", d.matched_ids.join("、"))
+            } else if let Some(ref sid) = d.sole_open_act_id {
+                format!("（本仓待动手项：{sid}）")
+            } else {
+                String::new()
+            };
+            println!("[{}] {}（{}，{}）{}", d.repo_label, d.rel_path, sz, t, match_note);
         }
     }
 
@@ -7316,26 +7609,30 @@ struct WaitFlags {
     owner_ref: Option<String>,
     brief: Option<String>,
     auto: bool,
+    clear_auto: bool,
     start_args: Vec<String>,
     clear_wait: bool,
 }
 
 fn normalize_verify_condition(raw: &str) -> Res<String> {
+    if raw.contains(['\n', '\r', '\0']) {
+        return Err(format!(
+            "invalid --verify-on {:?} (must be single-line without control characters)",
+            raw
+        ));
+    }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("--verify-on requires a non-empty condition".into());
     }
     if trimmed.starts_with("cmd:") {
         return Err(
-            "--verify-on does not support cmd: (supported: run_applied:<run>, work_applied:<Wxx>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
+            "--verify-on does not support cmd: (supported: run_applied:<run>, work_applied:<Wxx>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>, human:<text>)"
                 .into(),
         );
     }
     if let Some(run_ref) = trimmed.strip_prefix("run_applied:") {
-        let r = run_ref.trim();
-        if r.is_empty() {
-            return Err("invalid --verify-on 'run_applied:' (missing run id)".into());
-        }
+        let r = validate_run_ref(run_ref, "--verify-on run_applied:")?;
         return Ok(format!("run_applied:{r}"));
     }
     if let Some(wid) = trimmed.strip_prefix("work_applied:") {
@@ -7349,11 +7646,7 @@ fn normalize_verify_condition(raw: &str) -> Res<String> {
         return Ok(format!("work_closed:{norm}"));
     }
     if let Some(oref) = trimmed.strip_prefix("owner:") {
-        let o = oref.trim();
-        if o.is_empty() {
-            return Err("invalid --verify-on 'owner:' (missing owner ref)".into());
-        }
-        let norm = normalize_work_id(o).unwrap_or_else(|| o.to_string());
+        let norm = validate_owner_ref(oref, "--verify-on owner:")?;
         return Ok(format!("owner:{norm}"));
     }
     if let Some(sha) = trimmed.strip_prefix("commit_exists:") {
@@ -7368,8 +7661,15 @@ fn normalize_verify_condition(raw: &str) -> Res<String> {
         }
         return Ok(format!("commit_exists:{}", s_clean.to_ascii_lowercase()));
     }
+    if let Some(text) = trimmed.strip_prefix("human:") {
+        let t = text.trim();
+        if t.is_empty() {
+            return Err("invalid --verify-on 'human:' (requires non-empty description)".into());
+        }
+        return Ok(format!("human:{t}"));
+    }
     Err(format!(
-        "invalid --verify-on '{trimmed}' (supported: run_applied:<run>, work_applied:<Wxx>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>)"
+        "invalid --verify-on '{trimmed}' (supported: run_applied:<run>, work_applied:<Wxx>, work_closed:<Wxx>, owner:<Qxx>, commit_exists:<sha>, human:<text>)"
     ))
 }
 
@@ -7396,6 +7696,7 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
         owner_ref: None,
         brief: None,
         auto: false,
+        clear_auto: false,
         start_args: Vec::new(),
         clear_wait: false,
     };
@@ -7436,6 +7737,7 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
         match key {
             "--json" => json_mode = true,
             "--auto" => wf.auto = true,
+            "--no-auto" if allow_clear => wf.clear_auto = true,
             "--needs-verify" => wf.needs_verify = Some(true),
             "--no-needs-verify" if allow_clear => wf.needs_verify = Some(false),
             "--clear" if allow_clear => wf.clear_wait = true,
@@ -7444,6 +7746,13 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
             }
             "--after-applied" => {
                 let raw = take_val(key, &mut i)?;
+                if raw.contains(['\n', '\r', '\0']) {
+                    return Err(format!(
+                        "invalid value in --after-applied: {:?} (must not contain newlines)",
+                        raw
+                    ));
+                }
+                let mut added = 0usize;
                 for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     if let Some(wid) = part.strip_prefix("work_applied:") {
                         let norm = normalize_work_id(wid)
@@ -7453,31 +7762,55 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                         let norm = normalize_work_id(part).unwrap();
                         wf.wait_on.push(format!("work_applied:{norm}"));
                     } else {
-                        wf.wait_on.push(format!("run_applied:{part}"));
+                        let r = validate_run_ref(part, "--after-applied")?;
+                        wf.wait_on.push(format!("run_applied:{r}"));
                     }
+                    added += 1;
+                }
+                if added == 0 {
+                    return Err("--after-applied requires a non-empty run id or work id".into());
                 }
             }
             "--after-delivered" => {
                 let raw = take_val(key, &mut i)?;
+                if raw.contains(['\n', '\r', '\0']) {
+                    return Err(format!(
+                        "invalid value in --after-delivered: {:?} (must not contain newlines)",
+                        raw
+                    ));
+                }
+                let mut added = 0usize;
                 for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    wf.wait_on.push(format!("run_delivered:{part}"));
+                    let r = validate_run_ref(part, "--after-delivered")?;
+                    wf.wait_on.push(format!("run_delivered:{r}"));
+                    added += 1;
+                }
+                if added == 0 {
+                    return Err("--after-delivered requires a non-empty run id".into());
                 }
             }
             "--after-work" => {
                 let raw = take_val(key, &mut i)?;
+                if raw.contains(['\n', '\r', '\0']) {
+                    return Err(format!(
+                        "invalid value in --after-work: {:?} (must not contain newlines)",
+                        raw
+                    ));
+                }
+                let mut added = 0usize;
                 for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     let norm = normalize_work_id(part)
                         .ok_or_else(|| format!("invalid work id in --after-work: '{part}'"))?;
                     wf.wait_on.push(format!("work_closed:{norm}"));
+                    added += 1;
+                }
+                if added == 0 {
+                    return Err("--after-work requires a non-empty work id".into());
                 }
             }
             "--wait-owner" => {
                 let raw = take_val(key, &mut i)?;
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    return Err("--wait-owner requires a non-empty ref (e.g. Q18, D002)".into());
-                }
-                let norm = normalize_work_id(trimmed).unwrap_or_else(|| trimmed.to_string());
+                let norm = validate_owner_ref(&raw, "--wait-owner")?;
                 wf.owner_ref = Some(norm.clone());
                 wf.wait_on.push(format!("owner:{norm}"));
             }
@@ -7508,7 +7841,8 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
             | "--recommendation"
             | "--rec"
             | "--if-undecided"
-            | "--cost" => {
+            | "--cost"
+            | "--drop-path" => {
                 let raw = take_val(key, &mut i)?;
                 extra.entry(key.to_string()).or_default().push(raw);
             }
@@ -7541,18 +7875,23 @@ fn parse_wait_conditions(args: &[String], allow_clear: bool) -> Res<ParsedWaitAr
                     "--rec",
                     "--if-undecided",
                     "--cost",
+                    "--drop-path",
                 ];
                 let usage = if allow_clear {
-                    valid.extend_from_slice(&["--no-needs-verify", "--clear"]);
-                    "delegate work wait <Wxx|Qxx|Dxxx> [--class C] [--files P] [--after-applied X] [--after-work W] [--wait-owner Q] [--needs-owner K] [--brief FILE] [--clear] [--json]"
+                    valid.extend_from_slice(&["--no-needs-verify", "--no-auto", "--clear"]);
+                    "delegate work wait <Wxx|Qxx|Dxxx> [--class C] [--files P] [--after-applied X] [--after-work W] [--wait-owner Q] [--needs-owner K] [--drop-path P] [--brief FILE] [--no-auto] [--clear] [--json]"
                 } else {
-                    "delegate work add \"<title>\" [--class C] [--files P] [--done-when TEXT] [--repo PATH] [--brief FILE] [--after-applied X] [--needs-owner K] [--json]"
+                    "delegate work add \"<title>\" [--class C] [--files P] [--done-when TEXT] [--repo PATH] [--brief FILE] [--after-applied X] [--needs-owner K] [--drop-path P] [--json]"
                 };
                 return Err(unrecognized_arg(a, &valid, usage));
             }
             other => positional.push(other.to_string()),
         }
         i += 1;
+    }
+
+    if wf.auto && wf.clear_auto {
+        return Err("--auto and --no-auto cannot be combined".into());
     }
 
     Ok(ParsedWaitArgs {
@@ -7670,6 +8009,10 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         .and_then(|v| v.last())
         .cloned();
     let cost_raw = extra.get("--cost").and_then(|v| v.last()).cloned();
+    let drop_path = match extra.get("--drop-path").and_then(|v| v.last()) {
+        Some(raw) => crate::config::validate_relative_drop_path(raw, "--drop-path")?,
+        None => String::new(),
+    };
 
     let needs_owner_kind = match extra.get("--needs-owner").and_then(|v| v.last()) {
         Some(raw) => {
@@ -7696,6 +8039,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             || rec_raw.is_some()
             || if_undecided_raw.is_some()
             || cost_raw.is_some()
+            || !drop_path.is_empty()
             || explicit_id_raw.as_deref().is_some_and(is_owner_id));
 
     let pos_title = positional.join(" ").trim().to_string();
@@ -7738,6 +8082,8 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                         .unwrap_or("")
                         .to_string(),
                     cost: cost_raw.as_deref().map(str::trim).unwrap_or("").to_string(),
+                    drop_path: drop_path.clone(),
+                    last_drop_hint: String::new(),
                 }),
                 None,
             )
@@ -7762,6 +8108,8 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                     recommendation: validated.recommendation,
                     if_undecided: validated.if_undecided,
                     cost: validated.cost,
+                    drop_path: drop_path.clone(),
+                    last_drop_hint: String::new(),
                 }),
                 None,
             )
@@ -7872,6 +8220,8 @@ fn add_cmd(args: &[String]) -> Res<i32> {
                     recommendation: nf.recommendation.clone(),
                     if_undecided: nf.if_undecided.clone(),
                     cost: nf.cost.clone(),
+                    drop_path: drop_path.clone(),
+                    last_drop_hint: String::new(),
                 }),
                 created_at: now_iso.clone(),
                 updated_at: now_iso.clone(),
@@ -7915,6 +8265,12 @@ fn add_cmd(args: &[String]) -> Res<i32> {
             } else {
                 "attention"
             }
+        } else if brief.trim().is_empty()
+            && auto_dispatch.is_none()
+            && (wf.verify_on.iter().any(|c| c.starts_with("human:"))
+                || wf.needs_verify.unwrap_or(false))
+        {
+            "verify"
         } else {
             "ready"
         };
@@ -7984,6 +8340,7 @@ fn add_cmd(args: &[String]) -> Res<i32> {
         }
 
         items.push(item);
+        let _ = crate::owner_drop::sync_locked(&state, &mut items, None);
         let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         save_raw(&state, &items)?;
         (id, created_q, rec)
@@ -8057,6 +8414,10 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         .and_then(|v| v.last())
         .cloned();
     let cost_raw = extra.get("--cost").and_then(|v| v.last()).cloned();
+    let drop_path_update = match extra.get("--drop-path").and_then(|v| v.last()) {
+        Some(raw) => Some(crate::config::validate_relative_drop_path(raw, "--drop-path")?),
+        None => None,
+    };
     let class_update = match extra.get("--class").and_then(|v| v.last()) {
         Some(raw) => Some(validate_work_class(raw)?),
         None => None,
@@ -8076,9 +8437,11 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
     let has_owner_field_updates = ask_raw.is_some()
         || rec_raw.is_some()
         || if_undecided_raw.is_some()
-        || cost_raw.is_some();
+        || cost_raw.is_some()
+        || drop_path_update.is_some();
 
     if !wf.clear_wait
+        && !wf.clear_auto
         && wf.wait_on.is_empty()
         && wf.verify_on.is_empty()
         && wf.needs_verify.is_none()
@@ -8090,7 +8453,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         && needs_owner_kind.is_none()
         && !has_owner_field_updates
     {
-        return Err("work wait requires at least one condition (--class / --files / --after-applied / --after-delivered / --after-work / --wait-owner / --needs-owner / --after-time / --needs-verify / --verify-on / --brief / --ask / --recommendation / --if-undecided / --cost / --clear)".into());
+        return Err("work wait requires at least one condition (--class / --files / --after-applied / --after-delivered / --after-work / --wait-owner / --needs-owner / --after-time / --needs-verify / --verify-on / --brief / --ask / --recommendation / --if-undecided / --cost / --drop-path / --no-auto / --clear)".into());
     }
 
     let recorded_wait_on = !wf.wait_on.is_empty() || needs_owner_kind.is_some();
@@ -8165,6 +8528,8 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
                     recommendation: validated.recommendation,
                     if_undecided: validated.if_undecided,
                     cost: validated.cost,
+                    drop_path: drop_path_update.clone().unwrap_or_default(),
+                    last_drop_hint: String::new(),
                 }),
                 created_at: now_iso.clone(),
                 updated_at: now_iso.clone(),
@@ -8179,7 +8544,7 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         } else {
             if has_owner_field_updates {
                 let Some(ow) = items[pos].owner.as_mut() else {
-                    return Err("--ask / --recommendation / --if-undecided / --cost 仅用于所有者事项（Q/D）或配合 --needs-owner 使用".into());
+                    return Err("--ask / --recommendation / --if-undecided / --cost / --drop-path 仅用于所有者事项（Q/D）或配合 --needs-owner 使用".into());
                 };
                 if let Some(ref raw) = ask_raw {
                     let v = raw.trim();
@@ -8212,6 +8577,9 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
                     }
                     ow.cost = v.to_string();
                 }
+                if let Some(ref dp) = drop_path_update {
+                    ow.drop_path = dp.clone();
+                }
             }
             None
         };
@@ -8219,6 +8587,8 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
         let item = &mut items[pos];
         if wf.clear_wait {
             item.wait_on.clear();
+        }
+        if wf.clear_auto {
             item.auto_dispatch = None;
         }
         for c in wf.wait_on.iter().chain(extra_wait_on.iter()) {
@@ -8265,13 +8635,19 @@ fn wait_cmd(args: &[String]) -> Res<i32> {
             item.defer_streak = 0;
             item.set_state("blocked", &now_iso);
         } else if wf.clear_wait && item.state == "blocked" {
-            item.set_state("ready", &now_iso);
+            let next_st = if item.enters_verify_without_runs() {
+                "verify"
+            } else {
+                "ready"
+            };
+            item.set_state(next_st, &now_iso);
         }
         if let Some(c) = cur_caller {
             item.caller = c;
         }
         item.updated_at = now_iso;
 
+        let _ = crate::owner_drop::sync_locked(&state, &mut items, None);
         let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&wait_prefetch));
         save_raw(&state, &items)?;
         (created_q, rec)
@@ -8375,6 +8751,8 @@ fn close_cmd(args: &[String]) -> Res<i32> {
         items[pos].defer_streak = 0;
         items[pos].set_state("done", &now_iso);
         let snap = items[pos].clone();
+        let _ = crate::owner_drop::ack_matched_for_work_locked(&state, &snap);
+        let _ = crate::owner_drop::sync_locked(&state, &mut items, None);
         let rec = reconcile_all_locked_with_prefetch(&state, &mut items, None, Some(&prefetch));
         save_raw(&state, &items)?;
         (snap, rec)
@@ -8484,6 +8862,8 @@ fn drop_cmd(args: &[String]) -> Res<i32> {
         items[pos].defer_streak = 0;
         items[pos].set_state("done", &now_iso);
         let snap = items[pos].clone();
+        let _ = crate::owner_drop::ack_matched_for_work_locked(&state, &snap);
+        let _ = crate::owner_drop::sync_locked(&state, &mut items, None);
         let deps: Vec<String> = items
             .iter()
             .filter(|w| {
@@ -8603,6 +8983,7 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
         let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
         let mut items = load_raw(&state);
         let _ = migrate_legacy_locked(&state, &mut items);
+        let _ = crate::owner_drop::sync_locked(&state, &mut items, None);
 
         if let Some(norm) = normalize_work_id(&raw) {
             let pos = items.iter().position(|w| w.id == norm).ok_or_else(|| {
@@ -8611,6 +8992,9 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
             items[pos].defer_reason = r;
             items[pos].defer_until = until_iso;
             items[pos].defer_streak = items[pos].defer_streak.saturating_add(1);
+            if let Some(ow) = items[pos].owner.as_mut() {
+                ow.last_drop_hint.clear();
+            }
             items[pos].set_state("deferred", &now_iso);
             let snap = items[pos].clone();
             save_raw(&state, &items)?;
@@ -8713,6 +9097,119 @@ fn defer_cmd(args: &[String]) -> Res<i32> {
             deferred_item.defer_until,
             deferred_item.defer_reason,
             deferred_item.id
+        );
+    }
+    Ok(0)
+}
+
+fn ack_drop_cmd(args: &[String]) -> Res<i32> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut all_flag = false;
+    let mut repo_arg: Option<String> = None;
+    let mut json_mode = crate::output::json_enabled();
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let (key, inline) = a
+            .split_once('=')
+            .map_or((a.as_str(), None), |(k, v)| (k, Some(v)));
+        match key {
+            "--all" => all_flag = true,
+            "--json" => json_mode = true,
+            "--repo" => {
+                let v = match inline {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        args.get(i)
+                            .cloned()
+                            .ok_or("argument --repo: expected one argument")?
+                    }
+                };
+                repo_arg = Some(v);
+            }
+            other if other.starts_with('-') => {
+                return Err(unrecognized_arg(
+                    a,
+                    &["--all", "--repo", "--json"],
+                    "delegate work ack-drop [<path>|--all] [--repo <目录>] [--json]",
+                ));
+            }
+            other => paths.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    if !all_flag && paths.is_empty() {
+        return Err("usage: delegate work ack-drop [<path>|--all] [--repo <目录>] [--json]".into());
+    }
+
+    let state = state_dir();
+    fs::create_dir_all(&state).map_err(|e| format!("{}: {e}", state.display()))?;
+
+    let (repo_path, acked_paths) = {
+        let _guard = crate::locks::acquire_state(&state).map_err(|e| e.to_string())?;
+        let mut items = load_raw(&state);
+        let target_repo = if let Some(ref raw_r) = repo_arg {
+            let p = PathBuf::from(raw_r);
+            if p.exists() {
+                let top = git_top_fast(&p).unwrap_or(p);
+                fs::canonicalize(&top).unwrap_or(top)
+            } else {
+                // Allow matching by short repo name from seen state or work items.
+                let seen = crate::owner_drop::SeenState::load(&state);
+                seen.repos
+                    .keys()
+                    .find(|k| short_repo_name(k) == raw_r.as_str() || k.as_str() == raw_r.as_str())
+                    .or_else(|| {
+                        items
+                            .iter()
+                            .map(|w| &w.repo)
+                            .find(|r| short_repo_name(r) == raw_r.as_str() || r.as_str() == raw_r.as_str())
+                    })
+                    .map(PathBuf::from)
+                    .ok_or_else(|| format!("repository not found for --repo '{raw_r}'"))?
+            }
+        } else {
+            let cur = current_repo_str();
+            if cur.is_empty() {
+                return Err("cannot determine current repository (pass --repo <目录>)".into());
+            }
+            PathBuf::from(cur)
+        };
+        let (acked, work_changed) = crate::owner_drop::ack_drop_locked(
+            &state,
+            &target_repo,
+            &paths,
+            all_flag,
+            &mut items,
+        )?;
+        if work_changed {
+            save_raw(&state, &items)?;
+        }
+        (target_repo, acked)
+    };
+
+    if json_mode {
+        println!(
+            "{}",
+            json!({
+                "repo": repo_path.to_string_lossy(),
+                "acked": acked_paths,
+                "all": all_flag,
+            })
+        );
+    } else if acked_paths.is_empty() {
+        println!(
+            "交接目录无待确认新文件（{}）",
+            short_repo_name(&repo_path.to_string_lossy())
+        );
+    } else {
+        println!(
+            "已确认交接目录投递（{}）：{}",
+            short_repo_name(&repo_path.to_string_lossy()),
+            acked_paths.join("、")
         );
     }
     Ok(0)
@@ -9780,6 +10277,7 @@ mod tests {
                 recommendation: "建议先跑 2 天验证再决定".into(),
                 if_undecided: "沿用固定片段".into(),
                 cost: "2 天开发".into(),
+                ..Default::default()
             }),
             created_at: "2026-11-23T08:00:00Z".into(),
             updated_at: "2026-11-23T08:00:00Z".into(),
@@ -10447,6 +10945,7 @@ mod tests {
                 recommendation: "建议选方案 A，回滚成本低".into(),
                 if_undecided: "继续使用旧路由".into(),
                 cost: "半天开发".into(),
+                ..Default::default()
             }),
             created_at: "2026-11-24T10:00:00Z".into(),
             updated_at: "2026-11-24T10:00:00Z".into(),
@@ -10991,6 +11490,7 @@ mod tests {
             title: "上游底座".into(),
             state: "ready".into(),
             class: "feat".into(),
+            brief: "docs/w001.md".into(),
             ..Default::default()
         };
         let w2 = WorkItem {
@@ -10999,6 +11499,7 @@ mod tests {
             title: "下游接线".into(),
             state: "blocked".into(),
             class: "feat".into(),
+            brief: "docs/w002.md".into(),
             wait_on: vec!["work_applied:W001".into()],
             ..Default::default()
         };
@@ -11122,6 +11623,7 @@ mod tests {
                 repo: repo.to_string_lossy().into_owned(),
                 state: "ready".into(),
                 class: "feat".into(),
+                brief: "docs/w001.md".into(),
                 state_since: "2026-11-25T13:35:00Z".into(),
                 ..Default::default()
             },
@@ -11367,5 +11869,222 @@ mod tests {
         assert!(!s(&json(r1.join("meta.json")), "appliedAt").is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn human_verify_enters_verify_without_runs_when_unbriefed_and_never_auto_closes() {
+        let dir = temp_dir("human-verify-state");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let now_ep = epoch() as i64;
+
+        // Normalization accepts non-empty human:<text> and rejects empty/multiline
+        assert_eq!(
+            normalize_verify_condition("human:核对演示环境登录").unwrap(),
+            "human:核对演示环境登录"
+        );
+        assert!(normalize_verify_condition("human:   ").is_err());
+        assert!(normalize_verify_condition("human:line1\nline2").is_err());
+
+        let mut items = vec![
+            // W001: unbriefed, unrun, human: verify -> enters and stays `verify`
+            WorkItem {
+                id: "W001".into(),
+                title: "人工确认配置".into(),
+                repo: "/work/demo".into(),
+                state: "ready".into(),
+                verify_on: vec!["human:核对演示环境登录".into()],
+                state_since: "2026-11-28T00:00:00Z".into(),
+                ..Default::default()
+            },
+            // W002: WITH brief, unrun, human: verify -> stays `ready`
+            WorkItem {
+                id: "W002".into(),
+                title: "需派活后人工确认".into(),
+                repo: "/work/demo".into(),
+                state: "ready".into(),
+                brief: "docs/w002.md".into(),
+                verify_on: vec!["human:核对上线结果".into()],
+                state_since: "2026-11-28T00:00:00Z".into(),
+                ..Default::default()
+            },
+        ];
+
+        let rec = reconcile_all_locked_full(&state, &mut items, None, None, false);
+        assert!(rec.changed);
+        assert_eq!(items[0].state, "verify");
+        assert_eq!(items[1].state, "ready");
+
+        // Reconcile again: W001 never auto-closes!
+        let rec2 = reconcile_all_locked_full(&state, &mut items, None, None, false);
+        assert!(!rec2.changed);
+        assert_eq!(items[0].state, "verify");
+
+        // Condition evaluates to satisfied=false with 待人工确认
+        let ev = evaluate_condition("human:核对演示环境登录", &items[0], &items, &state, now_ep);
+        assert!(!ev.satisfied);
+        assert_eq!(ev.detail, "待人工确认：核对演示环境登录");
+
+        // Focus shows 待验(<text>) when done_when is empty
+        let focus = focus_for_item(&items[0], &items, &state, now_ep);
+        assert!(focus.contains("待验(核对演示环境登录)"), "got: {focus}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unbriefed_unrun_ready_item_has_no_eta_and_no_start_command() {
+        let dir = temp_dir("unbriefed-no-eta");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let now = 1_800_000_000_i64;
+        let repo = "/work/demo";
+
+        let w1 = WorkItem {
+            id: "W001".into(),
+            repo: repo.into(),
+            title: "纯人工跟进项".into(),
+            state: "ready".into(),
+            class: "feat".into(),
+            state_since: "2026-11-28T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let items = vec![w1.clone()];
+        let model = crate::speed::build_eta_model_in(&state, now);
+        let ctx = crate::eta::LiveContext {
+            now_ts: now,
+            ..Default::default()
+        };
+        let dag = crate::eta::estimate_work_dag_in(&items, None, &model, &ctx);
+        assert_eq!(dag.write_chains, 0);
+        let ie = dag.items.iter().find(|x| x.id == "W001").unwrap();
+        assert_eq!(ie.short_text, "-");
+        assert_eq!(ie.focus_badge, "-");
+
+        let ready_cmd = ready_command_for(&w1);
+        assert!(
+            ready_cmd.contains("无任务说明：补 delegate work wait W001 --brief <文件> 再派，或直接 delegate work close W001 --evidence \"…\""),
+            "got: {ready_cmd}"
+        );
+        assert!(!ready_cmd.contains("delegate start"), "got: {ready_cmd}");
+
+        let next_act = next_action_for(&w1, &items, &state);
+        assert_eq!(
+            next_act,
+            "work wait W001 --brief <文件> 或 work close W001 --evidence \"…\""
+        );
+
+        let focus = focus_for_item(&w1, &items, &state, now);
+        assert!(focus.contains("缺说明"), "got: {focus}");
+
+        let card = render_card_with_eta(&w1, &items, &state, now, Some(&dag));
+        assert!(!card.contains("预计耗时"), "got: {card}");
+        assert!(!card.contains("现派"), "got: {card}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owner_act_card_renders_delivery_location_only_when_configured() {
+        let dir = temp_dir("owner-delivery-loc");
+        let state = dir.join("state");
+        let repo_cfg = dir.join("repo-cfg");
+        let repo_plain = dir.join("repo-plain");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&repo_cfg).unwrap();
+        fs::create_dir_all(&repo_plain).unwrap();
+        write_json(repo_cfg.join(".delegate.json"), &json!({"ownerDrop": ["tmp/"]})).unwrap();
+
+        let q_act_repo = WorkItem {
+            id: "Q01".into(),
+            title: "提供凭据".into(),
+            repo: repo_cfg.to_string_lossy().into_owned(),
+            state: "attention".into(),
+            owner: Some(OwnerInfo {
+                kind: "act".into(),
+                ask: "请建好演示应用凭据".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let card1 = render_card(&q_act_repo, std::slice::from_ref(&q_act_repo), &state, 0);
+        assert!(
+            card1.contains("交付位置：本机材料可放 tmp/，主控会自动看到（跨机或网页操作请在对话说一声）"),
+            "got: {card1}"
+        );
+
+        let mut q_act_custom = q_act_repo.clone();
+        q_act_custom.owner.as_mut().unwrap().drop_path = "tmp/secret/demo-oauth".into();
+        let card2 = render_card(&q_act_custom, std::slice::from_ref(&q_act_custom), &state, 0);
+        assert!(
+            card2.contains("交付位置：本机材料可放 tmp/secret/demo-oauth，主控会自动看到（跨机或网页操作请在对话说一声）"),
+            "got: {card2}"
+        );
+
+        let mut q_nod = q_act_repo.clone();
+        q_nod.owner.as_mut().unwrap().kind = "nod".into();
+        let card3 = render_card(&q_nod, std::slice::from_ref(&q_nod), &state, 0);
+        assert!(!card3.contains("交付位置："), "got: {card3}");
+
+        let mut q_plain = q_act_repo.clone();
+        q_plain.repo = repo_plain.to_string_lossy().into_owned();
+        let card4 = render_card(&q_plain, std::slice::from_ref(&q_plain), &state, 0);
+        assert!(!card4.contains("交付位置："), "got: {card4}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_wait_validates_run_and_owner_refs_and_clear_preserves_auto_dispatch() {
+        // Reject newline-injected run id (`by\n<run-id>`), whitespace, and bad owner refs
+        assert!(parse_wait_conditions(
+            &["W001".into(), "--after-delivered".into(), "by\n20261128-120000-demo".into()],
+            true,
+        )
+        .is_err());
+        assert!(parse_wait_conditions(
+            &["W001".into(), "--after-applied".into(), "bad run id".into()],
+            true,
+        )
+        .is_err());
+        assert!(parse_wait_conditions(
+            &["W001".into(), "--after-delivered".into(), "".into()],
+            true,
+        )
+        .is_err());
+        assert!(parse_wait_conditions(
+            &["W001".into(), "--wait-owner".into(), "Q01\nextra".into()],
+            true,
+        )
+        .is_err());
+        assert!(parse_wait_conditions(
+            &["W001".into(), "--wait-owner".into(), "W005".into()],
+            true,
+        )
+        .is_err());
+
+        // Valid refs succeed
+        let ok = parse_wait_conditions(
+            &[
+                "W001".into(),
+                "--clear".into(),
+                "--after-delivered".into(),
+                "20261128-120000-demo".into(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert!(ok.wf.clear_wait);
+        assert!(!ok.wf.clear_auto);
+        assert_eq!(ok.wf.wait_on, vec!["run_delivered:20261128-120000-demo"]);
+
+        // `--no-auto` works and cannot combine with `--auto`
+        let ok_no_auto = parse_wait_conditions(&["W001".into(), "--no-auto".into()], true).unwrap();
+        assert!(ok_no_auto.wf.clear_auto);
+        assert!(parse_wait_conditions(
+            &["W001".into(), "--auto".into(), "--no-auto".into()],
+            true,
+        )
+        .is_err());
     }
 }

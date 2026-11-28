@@ -33,7 +33,7 @@ SSH host 只认用户配置；仓库 `remote.host` 始终报错。
 - `acceptBlind`（glob 数组，仓库覆盖用户）：交付命中仍可交付，但短行、JSON 与 apply 末行提示最多 5 个文件及余数。
 - `resultChars`（正整数，默认 20000，`DELEGATE_RESULT_CHARS` 优先）：答复超 1.25 倍才截断显示头尾；`--max-answer N` 超 1.5 倍自动续接压缩，不计返工。
 - `cleanupKeepExecutables` 追加去重（内置 `sccache`），按可执行文件名豁免回收，不能配路径。
-- `worktree`、`generated`、`applyVerify`、`board`、`mergeAccept`、`autoMerge`、`radar`、`areas`、`fill`、`hotspots`、`designPaths`（如 `["apps/ui-sandbox/"]`，任务说明路径命中时自动推断 `--class design`）只认仓库；用户级忽略并 stderr 提示。
+- `worktree`、`generated`、`applyVerify`、`board`、`mergeAccept`、`autoMerge`、`radar`、`areas`、`fill`、`hotspots`、`designPaths`（如 `["apps/ui-sandbox/"]`，任务说明路径命中时自动推断 `--class design`）只认仓库；用户级忽略并 stderr 提示。`ownerDrop`（仓库级相对路径数组，如 `["tmp/"]`，拒绝绝对路径、`..`、空串与用户级配置）：仅读 `lstat` 元数据（绝不读文件内容、不跟随符号链接、不设深度/文件数上限，单次扫 ≥1000 文件在 `status` 提醒一行），首次静默建基线，基线后新增/变更经 `hook check`/`work`/`snapshot` 零锁实时可见并在写路径落盘 `owner_drop` 事件与高置信唤醒 `deferred` 所有者项。
 - 两份文件独立校验，错指文件与字段退出 2；meta/summary/`--json` 记 `configSources`。普通 reply 沿用 env/deny/验收/证据，fresh 更新 deny/standing，返工与容量读当前配置。
 
 用户级示例：

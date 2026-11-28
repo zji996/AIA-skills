@@ -3952,6 +3952,7 @@ pub fn launch(
             initial_status,
         );
     }
+    crate::work::check_stale_and_expired();
     if !deferred && !scout_first {
         crate::eta::record_pred_started(&run, &meta);
     }
